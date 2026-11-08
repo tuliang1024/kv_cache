@@ -1,0 +1,16 @@
+目前有一个需求是借鉴vllm：/Users/l/L/Code/TuringProject/D/vllm或者vllm-ascend：/Users/l/L/Code/TuringProject/D/vllm-ascend中关于kv cache池化的实现代码逻辑，在deepinfer/Users/l/L/Code/TuringProject/D/DeepInfer中实现类似的功能
+
+具体需求：
+目前deepinfer是离线推理框架，希望增加online模式的kv cache池话功能，具体的主要是在prefill阶段执行请求前，根据上游提供的前缀匹配结果，先分配前缀匹配的block hbm内存，并进行异步的store，get操作，然后不阻塞调度器同时执行其他请求，然后等一下step开始执行，查看这个get操作是否完成，如果完成也是可以调度的状态，然后在执行相应的后续block分配并等待调度。
+
+
+有一个总体设计方案草稿，/Users/l/L/Code/TuringProject/D/设计文档/设计文档草稿.md，里面有涉及上述异步get的需求，但是主要实现逻辑还是参考vllm的对应实现，因为草稿可能有描述不准确或者错误的地方需要从代码里检查校验，所以：
+- 实现逻辑优先借鉴vllm的代码，
+- 可以查看方案草稿的，如果和vllm的代码实现逻辑有出入，以vllm代码逻辑为主，并需要指出
+
+现在需要做的事情：
+1。查看vllm和vllm-ascend的代码实现逻辑，确认前缀匹配的异步get流程，和时机
+2.查看deepinfer仓的现有代码逻辑，确认可以如何借鉴vllm的实现，支持可行性
+3.确认方案草稿和vllm对应代码实现逻辑
+
+注：先不生成对应设计文档

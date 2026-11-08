@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="960" viewBox="0 0 1280 960" role="img" aria-labelledby="title desc">
+  <title id="title">DeepInfer scheduler flow for KV completion and ALL ANY vote</title>
+  <desc id="desc">A clear flowchart showing completion polling, priority handling of kv_ready, asynchronous load admission, and the existing NORMAL ALL or ANY vote without crossing connectors.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#57606a"/></marker>
+    <style>
+      .title { font: 600 22px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; fill: #1f2328; }
+      .label { font: 600 15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; fill: #1f2328; }
+      .text { font: 13px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; fill: #424a53; }
+      .small { font: 12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; fill: #57606a; }
+      .box { stroke-width: 1.5; rx: 8; }
+      .sync { fill: #ddf4ff; stroke: #0969da; }
+      .async { fill: #fff8c5; stroke: #bf8700; }
+      .success { fill: #dafbe1; stroke: #1a7f37; }
+      .decode { fill: #f6f8fa; stroke: #57606a; }
+      .decision { fill: #fff; stroke: #57606a; stroke-width: 1.5; }
+      .line { fill: none; stroke: #57606a; stroke-width: 2; marker-end: url(#arrow); }
+      .dashed { fill: none; stroke: #bf8700; stroke-width: 2; stroke-dasharray: 7 5; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect width="1280" height="960" fill="#fff"/>
+  <text x="48" y="42" class="title">KV 完成处理与 NORMAL ALL / ANY 调度流程</text>
+  <text x="48" y="68" class="small">主流程自上而下；异步 KV load 不产生模型 token，也不作为 ALL / ANY 投票输入。</text>
+
+  <circle cx="640" cy="112" r="14" fill="#1a7f37"/>
+  <line x1="640" y1="126" x2="640" y2="160" class="line"/>
+  <rect x="500" y="160" width="280" height="58" class="box sync"/>
+  <text x="640" y="185" text-anchor="middle" class="label">LLMEngine 发起 completion poll</text>
+  <text x="640" y="204" text-anchor="middle" class="small">worker 返回完成事件，Scheduler 应用结果</text>
+
+  <line x1="640" y1="218" x2="640" y2="252" class="line"/>
+  <rect x="500" y="252" width="280" height="58" class="box success"/>
+  <text x="640" y="277" text-anchor="middle" class="label">优先处理 kv_ready</text>
+  <text x="640" y="296" text-anchor="middle" class="small">校验 load_id，统一各 rank 结果</text>
+
+  <line x1="640" y1="310" x2="640" y2="346" class="line"/>
+  <polygon points="640,346 730,400 640,454 550,400" class="decision"/>
+  <text x="640" y="395" text-anchor="middle" class="text">suffix block 和预算</text>
+  <text x="640" y="413" text-anchor="middle" class="text">是否满足？</text>
+
+  <line x1="550" y1="400" x2="350" y2="400" class="line"/>
+  <line x1="350" y1="400" x2="350" y2="480" class="line"/>
+  <rect x="205" y="480" width="290" height="58" class="box async"/>
+  <text x="350" y="505" text-anchor="middle" class="label">保持 kv_ready 队首</text>
+  <text x="350" y="524" text-anchor="middle" class="small">等待资源，不追加到 waiting 尾部</text>
+  <text x="520" y="389" class="small">否</text>
+
+  <line x1="730" y1="400" x2="930" y2="400" class="line"/>
+  <line x1="930" y1="400" x2="930" y2="480" class="line"/>
+  <rect x="785" y="480" width="290" height="58" class="box success"/>
+  <text x="930" y="505" text-anchor="middle" class="label">分配 suffix block</text>
+  <text x="930" y="524" text-anchor="middle" class="small">请求具备 Prefill 条件</text>
+  <text x="748" y="389" class="small">是</text>
+
+  <line x1="930" y1="538" x2="930" y2="590" class="line"/>
+  <line x1="930" y1="590" x2="640" y2="590" class="line"/>
+  <line x1="350" y1="538" x2="350" y2="590" class="line"/>
+  <line x1="350" y1="590" x2="640" y2="590" class="line"/>
+  <rect x="500" y="590" width="280" height="58" class="box async"/>
+  <text x="640" y="615" text-anchor="middle" class="label">admit 新 KV load</text>
+  <text x="640" y="634" text-anchor="middle" class="small">仅分配资源和提交 task，不产生 token</text>
+
+  <line x1="640" y1="648" x2="640" y2="682" class="line"/>
+  <polygon points="640,682 730,736 640,790 550,736" class="decision"/>
+  <text x="640" y="731" text-anchor="middle" class="text">NORMAL 投票点？</text>
+  <text x="640" y="750" text-anchor="middle" class="small">`_has_prefill_waiting()` 只看可执行请求</text>
+
+  <line x1="730" y1="736" x2="930" y2="736" class="line"/>
+  <rect x="785" y="710" width="290" height="58" class="box decode"/>
+  <text x="930" y="735" text-anchor="middle" class="label">否：执行 decode</text>
+  <text x="930" y="754" text-anchor="middle" class="small">不触发 prompt vote</text>
+  <text x="748" y="725" class="small">否</text>
+
+  <line x1="550" y1="736" x2="350" y2="736" class="line"/>
+  <line x1="350" y1="736" x2="350" y2="820" class="line"/>
+  <rect x="205" y="820" width="290" height="58" class="box sync"/>
+  <text x="350" y="845" text-anchor="middle" class="label">是：执行 ALL / ANY allreduce</text>
+  <text x="350" y="864" text-anchor="middle" class="small">按现有投票结果决定步型</text>
+  <text x="520" y="725" class="small">是</text>
+
+  <line x1="495" y1="849" x2="640" y2="849" class="line"/>
+  <rect x="640" y="820" width="290" height="58" class="box success"/>
+  <text x="785" y="845" text-anchor="middle" class="label">执行 prompt 或 decode</text>
+  <text x="785" y="864" text-anchor="middle" class="small">异步 load 不改变既有步型</text>
+
+  <line x1="48" y1="920" x2="88" y2="920" class="line"/>
+  <text x="100" y="925" class="small">Scheduler 主流程</text>
+  <line x1="300" y1="920" x2="340" y2="920" class="dashed"/>
+  <text x="352" y="925" class="small">异步 KV load 相关步骤</text>
+</svg>
