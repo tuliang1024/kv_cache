@@ -7,11 +7,11 @@
 
 为 DeepInfer 设计 Prefill/Decode KV cache 完整 block 的异步 Put 方案，参考：
 
-- vLLM：`/Users/l/L/Code/TuringProject/D/vllm`
-- vLLM Ascend：`/Users/l/L/Code/TuringProject/D/vllm-ascend`
-- DeepInfer：`/Users/l/L/Code/TuringProject/D/DeepInfer`
-- 上游 Mooncake Store 设计：`/Users/l/L/Code/TuringProject/D/设计文档/mooncake_store.md`
-- 方案草稿：`/Users/l/L/Code/TuringProject/D/设计文档/DeepInfer阶段一异步KV_Get方案草稿.md`
+- vLLM：`vllm`
+- vLLM Ascend：`vllm-ascend`
+- DeepInfer：`DeepInfer`
+- 上游 Mooncake Store 设计：`设计文档/mooncake_store.md`
+- 方案草稿：`设计文档/DeepInfer阶段一异步KV_Get方案草稿.md`
 
 当前工作重点是设计文档草稿，不是直接实现代码。
 
@@ -141,17 +141,17 @@ rsvg-convert -o /tmp/async-block-put-sequence-final.png \
 将本文件和相关仓库同步到另一台电脑后，在新 Codex 会话中发送：
 
 ```text
-请先读取 /path/to/设计文档/codex-session-handoff-REQ-KVP-异步Put.md，
+请先读取 <repo-root>/设计文档/codex-session-handoff-REQ-KVP-异步Put.md，
 按其中的背景、结论和文件状态继续工作。先检查文件是否存在，再执行我后续的修改要求。
 ```
 
-随后把 `/path/to` 替换为新电脑上的实际仓库路径。
+随后把 `<repo-root>` 替换为新电脑上的实际仓库根目录。
 
 ### 方法 B：让 Codex 从交接文件恢复上下文
 
 ```text
 请读取以下会话交接文件并恢复工作上下文：
-/Users/l/L/Code/TuringProject/D/设计文档/codex-session-handoff-REQ-KVP-异步Put.md
+<repo-root>/设计文档/codex-session-handoff-REQ-KVP-异步Put.md
 
 恢复后先报告：
 1. 当前已完成内容；
