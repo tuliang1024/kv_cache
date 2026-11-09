@@ -55,8 +55,8 @@
 
   <path d="M832 322 L832 370" class="async"/>
   <rect x="748" y="370" width="168" height="48" class="box yellow"/>
-  <text x="760" y="391" class="text">等待 ready_event</text>
-  <text x="760" y="409" class="text">准备 HBM buffer</text>
+  <text x="760" y="391" class="text">等待 KV 写入完成事件</text>
+  <text x="760" y="409" class="text">确认 HBM 源数据稳定</text>
   <path d="M916 394 L1018 394" class="async"/>
   <rect x="1018" y="370" width="178" height="48" class="box yellow"/>
   <text x="1030" y="391" class="text">Store.put(items)</text>

@@ -2,7 +2,6 @@
 req: REQ-KVP-04
 module: kv-cache-pooling
 title: PE 前缀命中块异步 KV Get 与调度交接
-depends_on: [REQ-KVP-01, REQ-KVP-02, REQ-KVP-03, REQ-KVP-05, REQ-KVP-07]
 status: 草稿
 updated: "2026-11-09"
 ---
@@ -43,6 +42,11 @@ vLLM 的远端 KV 流程将“外部 block 分配、异步加载、完成确认�
 7. 成功请求进入优先处理的 `kv_ready` 队列；suffix block 分配成功后直接进入当前或下一轮 Prefill，不追加到普通 `waiting` 队尾。
 8. 失败请求按连续有效前缀截短，或整体按 miss 重新 Prefill；后台 Store 未完成前不得释放目标 block。
 
+当命中 prefix 后剩余 suffix 仍超过本轮 Prefill 预算时，`kv_ready` 只负责恢复请求的
+`WAITING`/持有 block 语义，后续仍沿用 DeepInfer 的 chunked Prefill 分块调度。每个 chunk
+完成后更新 `cache.num_tokens`；只有最后一个 chunk 的 `SequenceMetadata.is_last_prompt_chunk`
+为真时，才认为本次 Prefill 完成。异步 Get 不改变 `chunk_checkpoints`、预算或多模态切分规则。
+
 上游不传完整 Store key，也不在本需求中规定上游的数据结构。DeepInfer 只消费命中 token 数，并按本地运行时 `block_size` 计算命中 block 数。Python worker 使用请求 token、布局信息和本 rank 拓扑生成 Store key。Store 对象不存在或已被淘汰时，按实际 `get` 结果处理。
 
 ### 2.2 队列与状态
@@ -71,37 +75,7 @@ vLLM 在启动异步 load 后将请求放入 `kv_holding_waiting`；该队列优
 
 不新增与 vLLM `WAITING_FOR_REMOTE_KVS` 等价的自定义状态。若 DeepInfer 当前 `SequenceStatus` 不能安全加入该状态，则应在 `SequenceScheduleState` 中增加同名语义的字段，并保证 finished 状态判断不误将其视为完成。`schedule.schedulable` 仍不用于表示 KV loading。
 
-### 2.3 调度时机与投票
-
-![KV 完成处理与 ALL / ANY 投票](img/scheduler-vote-activity.svg)
-
-本节描述 Scheduler 内部的决策顺序和投票输入，采用单主路径流程图表示分支关系：异步 load 只更新后台状态，不触发 collective；`kv_ready` 的 suffix 资源准备完成后，才进入现有投票路径。
-
-每轮调度按以下顺序执行：
-
-```text
-poll/apply KV completion
-→ kv_ready 请求尝试分配 suffix block
-→ admission 新的 KV load（不产生模型 token）
-→ 执行现有 NORMAL ALL/ANY 投票
-→ prompt 或 decode
-```
-
-KV load admission：
-
-- 不增加 `num_batched_tokens` 和 `seqlens_q`。
-- 不设置 `prompt_run`，不清零 `decode_step`。
-- 不进入 `scheduled_seqs`，不参与 `_has_prefill_waiting()`。
-- 不触发新的 DP collective；只在真正进入 suffix Prefill 时要求各 rank 结果一致。
-
-`kv_loading` 队列独立于 `waiting`，因此不会触发 DeepInfer 当前队首 `break` 语义。`kv_ready` 是优先处理队列，不是普通 waiting 的尾部缓存：
-
-- Store 完成后，请求从 `kv_loading` 移入 `kv_ready`，保留其已加载 block 和 pin。
-- 每轮 Prefill 调度前先检查 `kv_ready`。suffix block 和本轮预算都满足时，直接在本轮 Prefill 扫描中调度该请求；资源或预算不足时继续保留在 `kv_ready` 队首。
-- 只有 suffix block 已经分配、请求具备 Prefill 条件后，才参与现有 ALL/ANY 投票。
-- suffix 资源不足时继续留在 `kv_ready`，不重复提交 Store `get`，也不与普通 waiting 竞争队尾顺序。
-
-### 2.4 失败、取消和资源不足
+### 2.3 失败、取消和资源不足
 
 - **逐 block 失败**：按 block 顺序保留从第一个 block 开始的连续成功前缀；失败 block 及后续 block 释放并按 miss 计算。
 - **只有请求级结果**：无法判断连续前缀时，整次按 miss 处理。
@@ -110,7 +84,7 @@ KV load admission：
 - **重复完成事件**：`load_id` 不匹配或请求已处理完成时丢弃，不得重复写 block table 或重复释放 block。
 - **Store 连接异常**：由 Mooncake backend 的重连、重注册和熔断逻辑处理；Scheduler 只接收失败结果，不等待重连。
 
-### 2.5 与现有 DeepInfer 入口的接入
+### 2.4 与现有 DeepInfer 入口的接入
 
 当前入口为：
 
@@ -135,7 +109,7 @@ LLMEngine.step()
 
 `SchedulerOutputs.kv_load_tasks` 必须是本轮输出拥有的任务数据。Python 在当前 `step()` 内立即转换为 worker 自有对象；不得借用会在下一轮 `schedule()` 中复用的 clone vector 生命周期。
 
-### 2.6 对现有 Scheduler 生命周期的影响
+### 2.5 对现有 Scheduler 生命周期的影响
 
 新增队列后，以下现有接口必须同步覆盖 `kv_loading` 和 `kv_ready`：
 
@@ -232,6 +206,9 @@ class Scheduler:
         self.admit_kv_loads(outputs)
         outputs.extend(self.schedule_normal_prefill_or_decode(sequence_metadata_pool))
         return outputs
+
+    # `schedule_prefill` 继续复用现有 chunked-prefill 路径；若 suffix 未在一轮完成，
+    # 请求按原有 chunk 状态在后续轮次继续执行，不重新提交 Store get。
 ```
 
 ### 4.2 KVPoolWorker
@@ -283,13 +260,11 @@ LLMEngine.step():
 
 测试用例只描述验证计划，不代表已经执行或通过。
 
-| 用例编号     | 类型     | 测试目的                             | 测试步骤                                                                          | 测试点 / 预期结果                                                                          |
-| ------------ | -------- | ------------------------------------ | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| TC-KVP-04-01 | 正常     | 验证完整命中异步恢复                 | 提交对齐的命中数；保持 Store 未完成；再返回全部 block 成功并执行下一轮 step       | get 期间其他请求继续调度；完成请求进入 `kv_ready` 优先队列并执行 suffix Prefill。        |
-| TC-KVP-04-02 | 正常     | 验证无命中复用原有 Prefill           | 提交 `hit_tokens == 0` 的请求并执行调度                                         | 不分配 prefix block、不生成异步 task，直接走现有 Prefill。                                 |
-| TC-KVP-04-03 | 并发     | 验证优先队列和投票边界               | 让一个请求完成 get、另一个请求仍在 `kv_loading`，分别设置 suffix 资源足够和不足 | `kv_ready` 优先处理；资源不足时保持队首；`kv_loading` 不参与 ALL/ANY，ready 后才参与。 |
-| TC-KVP-04-04 | 异常     | 验证部分失败和短读回退               | 多 block 请求中间 block 返回短读或失败                                            | 只保留连续有效前缀，后续 token 走普通 Prefill；不使用失败 block 后的数据。                 |
-| TC-KVP-04-05 | 异常     | 验证整体 miss 与资源清理             | 让 Store 返回请求级失败或首 block 失败                                            | prefix block 释放且不重复释放，命中数清零，请求优先回到 waiting 重新计算。                 |
-| TC-KVP-04-06 | 异常     | 验证取消、重复和过期完成事件         | get 在途时取消请求，再注入完成、重复完成和旧 `load_id` 事件                     | 事件被丢弃，block 只释放一次，不修改已取消或已完成请求。                                   |
-| TC-KVP-04-07 | 并发     | 验证 DP rank 结果统一                | 不同 rank 返回不同的连续成功长度                                                  | 所有 rank 使用最早失败 block 之前的共同前缀，再进入 collective Prefill。                   |
-| TC-KVP-04-08 | 生命周期 | 验证运行时 block size 和 Engine 关闭 | 分别测试对齐/未对齐命中数，并在 get 在途时关闭 Engine                             | 对齐依据运行时 `block_size`；未对齐按 miss；关闭前停止新任务并完成在途 HBM 访问清理。    |
+| 用例编号     | 类型 | 测试目的                     | 测试步骤                                                                          | 测试点 / 预期结果                                                                          |
+| ------------ | ---- | ---------------------------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| TC-KVP-04-01 | 正常 | 验证完整命中异步恢复         | 提交对齐的命中数；保持 Store 未完成；再返回全部 block 成功并执行下一轮 step       | get 期间其他请求继续调度；完成请求进入 `kv_ready` 优先队列并执行 suffix Prefill。        |
+| TC-KVP-04-02 | 正常 | 验证无命中复用原有 Prefill   | 提交 `hit_tokens == 0` 的请求并执行调度                                         | 不分配 prefix block、不生成异步 task，直接走现有 Prefill。                                 |
+| TC-KVP-04-03 | 并发 | 验证优先队列和投票边界       | 让一个请求完成 get、另一个请求仍在 `kv_loading`，分别设置 suffix 资源足够和不足 | `kv_ready` 优先处理；资源不足时保持队首；`kv_loading` 不参与 ALL/ANY，ready 后才参与。 |
+| TC-KVP-04-04 | 异常 | 验证部分失败和短读回退       | 多 block 请求中间 block 返回短读或失败                                            | 只保留连续有效前缀，后续 token 走普通 Prefill；不使用失败 block 后的数据。                 |
+| TC-KVP-04-05 | 异常 | 验证整体 miss 与资源清理     | 让 Store 返回请求级失败或首 block 失败                                            | prefix block 释放且不重复释放，命中数清零，请求优先回到 waiting 重新计算。                 |
+| TC-KVP-04-06 | 异常 | 验证取消、重复和过期完成事件 | get 在途时取消请求，再注入完成、重复完成和旧 `load_id` 事件                     | 事件被丢弃，block 只释放一次，不修改已取消或已完成请求。                                   |
