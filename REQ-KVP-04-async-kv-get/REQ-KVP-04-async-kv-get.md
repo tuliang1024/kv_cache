@@ -200,22 +200,6 @@ class KVPoolWorker:
         return self.completion_queue.drain()
 ```
 
-### 4.3 LLMEngine 调用顺序
-
-```text
-LLMEngine.step():
-    # Engine 发起 poll，并把结果交给 C++ Scheduler 应用。
-    completions = kv_worker.poll_completions()
-    scheduler.apply_kv_completions(completions)
-
-    seq_metadata, scheduler_outputs = scheduler.schedule(sequence_metadata_pool)
-
-    # SchedulerOutputs 在 Python 当前 step 内转换为 worker 自有 task。
-    kv_worker.submit_get_tasks(scheduler_outputs.kv_load_tasks)
-    post_schedule(scheduler_outputs)
-    execute_model_step(seq_metadata, scheduler_outputs)
-    process_model_outputs(scheduler_outputs)
-```
 
 ## 5. ST 测试用例
 
