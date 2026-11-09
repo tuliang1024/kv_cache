@@ -156,9 +156,7 @@ class Scheduler:
         while self.kv_ready:
             seq = self.kv_ready.front()
             suffix_blocks = self.required_suffix_blocks(seq)
-            if (not self.block_manager.can_allocate_nolock(suffix_blocks)
-                    or not self.prefill_budget_allows(seq)):
-                break
+
             self.allocate_suffix_blocks(seq, suffix_blocks)
             self.kv_ready.pop_front()
             self.schedule_prefill(seq)
