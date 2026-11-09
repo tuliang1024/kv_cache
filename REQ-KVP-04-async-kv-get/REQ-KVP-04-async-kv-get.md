@@ -89,7 +89,6 @@ LLMEngine.step()
 - C++ Scheduler 负责命中 block 的资源接纳、队列状态、`load_id`、完成事件和 block 生命周期。
 - Python worker 负责生成 Store key、构造已注册 HBM segment、后台调用 Mooncake `get` 和投递完成事件。
 - worker 不直接修改 `Sequence`、`block_table` 或 Scheduler 队列；所有状态变化在主调度线程应用。
-- `SchedulerOutputs.kv_load_tasks` 必须由本轮输出拥有，worker 在当前 `step()` 内转换为自有任务对象。
 
 ### 3.2 队列优先级
 
