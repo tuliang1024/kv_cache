@@ -223,21 +223,6 @@ class KVPoolWorker:
 
 `LLMEngine` 在调用 `KVPoolWorker.submit_put()` 前完成以下动作：复制 `block_ids`、调用 `pin_blocks()`、构造 key/address/size，并将 task 放入 pending 表。`KVPoolWorker` 不直接修改 `BlockManager` 或 `Sequence`。
 
-### 4.3 完整 block 计算
-
-```text
-full_blocks = committed_tokens // block_size
-start = seq.next_unsaved_block
-
-if full_blocks <= start:
-    return
-
-submit_put(seq, start, full_blocks, kv_write_event)
-seq.next_unsaved_block = full_blocks
-```
-
-末尾未满 block 不进入 `submit_put()`。当后续 Decode 使 `full_blocks` 增加时，该 block 会与其它新增完整 block 一起提交。
-
 ## 5. 测试用例
 
 | 用例编号     | 类型     | 测试目的                    | 前置条件                            | 步骤                                       | 预期结果                                                            |
