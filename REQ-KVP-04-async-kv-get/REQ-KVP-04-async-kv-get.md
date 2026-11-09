@@ -28,8 +28,6 @@ vLLM 的远端 KV 流程将“外部 block 分配、异步加载、完成确认�
 
 ![异步 KV Get 流程](img/async-kv-get-flow.svg)
 
-黄色虚线表示后台 Store 路径。Scheduler 提交 `KVLoadTask` 后继续调度其他请求；下一轮 `LLMEngine.step()` 先调用 worker 的 completion poll，再将完成事件交给 Scheduler 应用。
-
 流程顺序如下：
 
 1. 上游在 `add_sequence()` 前完成前缀匹配，向 DeepInfer 传入命中 token 数。
@@ -37,11 +35,11 @@ vLLM 的远端 KV 流程将“外部 block 分配、异步加载、完成确认�
 3. 调度接纳时校验命中结果并分配 prefix block，生成 `KVLoadTask`，请求转入 `kv_loading`。
 4. Python worker 依据请求 token、实际 block size、布局版本和 rank 拓扑生成 key，将每个 block 作为一个 Store item 提交到后台线程。
 5. Store 直接向已注册的 `gpu_blocks` HBM segment 写入数据。
-6. 下一轮 `LLMEngine.step()` 发起 completion poll，Scheduler 主线程校验 `load_id`、请求状态和各 rank 的结果。
-7. 成功请求进入优先处理的 `kv_ready` 队列；suffix block 分配成功后直接进入当前或下一轮 Prefill，不追加到普通 `waiting` 队尾。
+6. 下一轮 `LLMEngine.step()` 发起 completion poll，Scheduler 主线程校验 `load_id`、请求状态的结果。
+7. 成功请求进入优先处理的 `kv_ready` 队列；suffix block 分配成功后直接进入当前或下一轮 Prefill。
 8. 失败请求按连续有效前缀截短，或整体按 miss 重新 Prefill；后台 Store 未完成前不得释放目标 block。
 
-### 2.2 队列与状态
+### 2.2 队列
 
 新增两个 Scheduler 专用队列：
 
@@ -49,7 +47,6 @@ vLLM 的远端 KV 流程将“外部 block 分配、异步加载、完成确认�
 kv_loading    prefix block 已分配，Store get 进行中
 kv_ready      Store get 已完成，等待 suffix block 分配
 ```
-vLLM 使用 `WAITING_FOR_REMOTE_KVS` 表示异步远端 KV 尚未完成，并区分“等待启动 load”和“已经持有 KV block”两个队列。DeepInfer 复用这一语义：
 
 ### 2.3 失败、取消和资源不足
 
@@ -79,8 +76,6 @@ LLMEngine.step()
     → post_schedule(scheduler_outputs)
     → execute_model_step()
 ```
-
-`SchedulerOutputs.kv_load_tasks` 必须是本轮输出拥有的任务数据。Python 在当前 `step()` 内立即转换为 worker 自有对象；不得借用会在下一轮 `schedule()` 中复用的 clone vector 生命周期。
 
 ## 3. 实现边界
 
