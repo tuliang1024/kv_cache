@@ -41,38 +41,15 @@ vLLM 的远端 KV 流程将“外部 block 分配、异步加载、完成确认�
 7. 成功请求进入优先处理的 `kv_ready` 队列；suffix block 分配成功后直接进入当前或下一轮 Prefill，不追加到普通 `waiting` 队尾。
 8. 失败请求按连续有效前缀截短，或整体按 miss 重新 Prefill；后台 Store 未完成前不得释放目标 block。
 
-当命中 prefix 后剩余 suffix 仍超过本轮 Prefill 预算时，`kv_ready` 只负责恢复请求的
-`WAITING`/持有 block 语义，后续仍沿用 DeepInfer 的 chunked Prefill 分块调度。每个 chunk
-完成后更新 `cache.num_tokens`；只有最后一个 chunk 的 `SequenceMetadata.is_last_prompt_chunk`
-为真时，才认为本次 Prefill 完成。异步 Get 不改变 `chunk_checkpoints`、预算或多模态切分规则。
-
-上游不传完整 Store key，也不在本需求中规定上游的数据结构。DeepInfer 只消费命中 token 数，并按本地运行时 `block_size` 计算命中 block 数。Python worker 使用请求 token、布局信息和本 rank 拓扑生成 Store key。Store 对象不存在或已被淘汰时，按实际 `get` 结果处理。
-
 ### 2.2 队列与状态
 
 新增两个 Scheduler 专用队列：
 
 ```text
-waiting       普通请求，或已具备 Prefill 条件的请求
 kv_loading    prefix block 已分配，Store get 进行中
 kv_ready      Store get 已完成，等待 suffix block 分配
-prompted      已完成 prompt、等待进入 running 的请求
-running       当前 decode 或已进入执行批次的请求
 ```
-
 vLLM 使用 `WAITING_FOR_REMOTE_KVS` 表示异步远端 KV 尚未完成，并区分“等待启动 load”和“已经持有 KV block”两个队列。DeepInfer 复用这一语义：
-
-```text
-SequenceStatus::WAITING_FOR_REMOTE_KVS
-kv_loading       # admission 前对应 async_kv_waiting；启动后表示 get 在途
-kv_ready         # 对应 kv_holding_waiting，持有已分配 prefix block
-prefix_hit_tokens
-kv_load_id
-```
-
-vLLM 在启动异步 load 后将请求放入 `kv_holding_waiting`；该队列优先于普通 `waiting` 检查。请求仍处于 `WAITING_FOR_REMOTE_KVS` 时只被跳过，completion 到达后在同一优先队列中恢复调度。因此 `kv_ready` 是 DeepInfer 对 `kv_holding_waiting` 的完成态拆分，不表示普通 `waiting` 的尾部重入。
-
-不新增与 vLLM `WAITING_FOR_REMOTE_KVS` 等价的自定义状态。若 DeepInfer 当前 `SequenceStatus` 不能安全加入该状态，则应在 `SequenceScheduleState` 中增加同名语义的字段，并保证 finished 状态判断不误将其视为完成。`schedule.schedulable` 仍不用于表示 KV loading。
 
 ### 2.3 失败、取消和资源不足
 
