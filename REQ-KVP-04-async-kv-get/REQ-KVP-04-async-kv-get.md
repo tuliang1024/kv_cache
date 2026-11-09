@@ -21,7 +21,6 @@ vLLM 的远端 KV 流程将“外部 block 分配、异步加载、完成确认�
 - 拉取期间继续调度其他可执行请求。
 - Store 完成后安全地恢复请求，并只计算未命中的 suffix。
 - 在 Store miss、短读、取消、超时和资源不足时释放或保留正确的 HBM block。
-- 保持 DeepInfer 现有 NORMAL ALL/ANY 投票和 prompt/decode 步型语义。
 
 ## 2. 设计说明
 
