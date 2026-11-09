@@ -55,9 +55,6 @@ vLLM 使用 `WAITING_FOR_REMOTE_KVS` 表示异步远端 KV 尚未完成，并区
 
 - **逐 block 失败**：按 block 顺序保留从第一个 block 开始的连续成功前缀；失败 block 及后续 block 释放并按 miss 计算。
 - **只有请求级结果**：无法判断连续前缀时，整次按 miss 处理。
-- **suffix 资源不足**：请求保留在 `kv_ready`，已加载 prefix block 继续 pin；可配置 ready 超时或内存压力回退为 miss。
-- **请求取消**：从 `waiting`、`kv_loading`、`kv_ready` 都可标记为 aborted；后台完成事件通过 `load_id` 和请求状态丢弃，随后释放本次任务持有的 block。
-- **重复完成事件**：`load_id` 不匹配或请求已处理完成时丢弃，不得重复写 block table 或重复释放 block。
 - **Store 连接异常**：由 Mooncake backend 的重连、重注册和熔断逻辑处理；Scheduler 只接收失败结果，不等待重连。
 
 ### 2.4 与现有 DeepInfer 入口的接入
@@ -84,18 +81,6 @@ LLMEngine.step()
 ```
 
 `SchedulerOutputs.kv_load_tasks` 必须是本轮输出拥有的任务数据。Python 在当前 `step()` 内立即转换为 worker 自有对象；不得借用会在下一轮 `schedule()` 中复用的 clone vector 生命周期。
-
-### 2.5 对现有 Scheduler 生命周期的影响
-
-新增队列后，以下现有接口必须同步覆盖 `kv_loading` 和 `kv_ready`：
-
-- `get_num_unfinished_seqs()`：计入两个 KV 队列，避免 Engine 在异步 get 完成前退出调度循环。
-- `has_unfinished_requests()`：通过上述统计保持跨 DP rank 的未完成状态一致。
-- `abort_sequence()`：扫描两个 KV 队列；对 `kv_loading` 请求先标记取消，再由完成事件应用路径释放 block。
-- `free_finished_seqs()` / `free_seq_nolock()`：覆盖取消、失败和超时后的 KV 队列，保证 block、pin 和任务上下文只释放一次。
-- `get_sum_prompt_len_waiting()`：只统计可执行的普通 `waiting`/`prompted`，不得把 `kv_loading` 或 `kv_ready` 当作 prompt work。
-
-这些修改只扩展请求生命周期统计和清理范围，不改变现有 `running` 的 decode、`prompted` 的交接和模型执行接口。
 
 ## 3. 实现边界
 
