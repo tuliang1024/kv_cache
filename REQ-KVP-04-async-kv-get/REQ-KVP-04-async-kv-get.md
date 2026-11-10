@@ -89,9 +89,49 @@ flowchart TD
     V --> A
 ```
 
-### 2.3 Get 额度与取消处理
+### 2.3 异步 Get 完成与 Scheduler 消费
 
-#### 2.3.1 Get 额度
+异步 Get 的后台线程不直接修改请求状态，也不直接操作 Scheduler 队列。它只负责从线程任务队列取出 `KVLoadTask`，执行 Mooncake Store `get`，将数据写入预先分配的 prefix block，并记录该任务的完成结果。vLLM 的对应实现中，worker 线程将完成的请求 ID 放入线程安全的完成集合；DeepInfer 采用等价的完成事件队列，事件至少包含 `request_id`、`load_id`、成功/失败状态、已完成 block 信息和错误信息。
+
+完成结果通过模型执行边界回到主流程，过程如下：
+
+1. Scheduler 为命中请求分配 prefix block 并提交 `KVLoadTask`；任务进入 KV Get worker 的任务队列，请求进入 `kv_loading`。
+2. KV Get worker 从任务队列取任务，执行 Mooncake Store `get`，将每个 block 写入对应的 GPU/HBM 地址；worker 只发布完成事件，不修改 `Request` 状态或 Scheduler 队列。
+3. worker 完成任务后，将 `request_id`、`load_id` 和结果写入线程安全的 completion 队列。完成事件表示 KV 数据已经写入目标 block，不表示请求已经完成 Prefill 或生成。
+4. `post_forward()` 或等价的 worker 输出阶段轮询 completion 队列，构造本轮的 KV connector 输出；输出中携带 `finished_recving`、失败请求和无效 block 等信息，并随 `ModelRunnerOutput` 返回主流程。
+5. Engine 主流程把该输出交给 Scheduler 的 completion 更新入口。Scheduler 在主线程校验 `request_id`、`load_id`、请求状态和 block 结果，丢弃重复、过期或已取消请求的无效事件。
+6. 校验成功时，Scheduler 标记 completion 已应用，更新已加载 prefix token/block 状态，从 `kv_loading` 移除请求并加入 `kv_ready`；请求在本次输出处理阶段不直接执行模型计算。
+7. 下一次 `Scheduler.schedule()` 优先扫描 `kv_ready`，计算 suffix block 数并尝试分配。分配成功后移出 `kv_ready`，加入本轮调度结果并执行 suffix Prefill；分配失败则保留请求和 prefix block，等待下一轮重试。
+
+```mermaid
+sequenceDiagram
+    participant S as Scheduler
+    participant Q as KV Get task queue
+    participant W as KV Get worker thread
+    participant C as completion queue
+    participant P as post_forward / worker output
+    participant E as Engine main flow
+
+    S->>Q: submit KVLoadTask(request_id, load_id, blocks)
+    S->>S: waiting -> kv_loading
+    W->>Q: dequeue task
+    W->>W: Mooncake Store get
+    W->>W: write data to target prefix blocks
+    W->>C: publish completion(request_id, load_id, result)
+    P->>C: poll completed events
+    P-->>E: ModelRunnerOutput.KVConnectorOutput
+    E->>S: update KV transfer completion
+    S->>S: validate request_id/load_id/result
+    S->>S: kv_loading -> kv_ready
+    S->>S: next schedule: suffix allocation
+    S-->>E: schedule suffix Prefill
+```
+
+因此，DeepInfer 的实现边界应保持为：后台线程负责传输和发布 completion，`LLMEngine.step()`/`post_forward()` 负责收集 completion，Scheduler 主线程负责状态和队列迁移。不能由 Get worker 线程直接把请求从 `kv_loading` 移到 `kv_ready`，也不能在线程中直接调用 Prefill。
+
+### 2.4 Get 额度与取消处理
+
+#### 2.4.1 Get 额度
 
 Scheduler 使用 `max_num_inflight_kv_loads` 限制同时占用的异步 Get 额度。新请求只有在下面的数量之和小于该上限时，才可以分配 prefix block 并提交异步 Get：
 
@@ -104,7 +144,7 @@ Scheduler 使用 `max_num_inflight_kv_loads` 限制同时占用的异步 Get 额
 
 其中，`aborted_kv_loads` 只记录已经取消、但底层 Get 尚未确认结束的请求或任务 ID。它们仍占用 Get 额度，直到 completion 到达或底层任务明确结束后才从集合移除并释放目标 block。
 
-#### 2.3.2 取消和资源释放
+#### 2.4.2 取消和资源释放
 
 取消请求时，Scheduler 主线程先从 `waiting`、`kv_loading` 和 `kv_ready` 中移除请求，再标记 `FINISHED_ABORTED`：
 
@@ -125,13 +165,13 @@ flowchart TD
 
 `kv_ready` 中的请求已经完成 Get，因此可以立即释放已加载的 prefix block；`kv_loading` 中的请求可能仍有后台线程向目标 block 写入，必须延迟释放，避免后台传输访问已被复用的 block。
 
-### 2.4 失败、取消和资源不足
+### 2.5 失败、取消和资源不足
 
 - **逐 block 失败**：按 block 顺序保留从第一个 block 开始的连续成功前缀；失败 block 及后续 block 释放并按 miss 计算。
 - **只有请求级结果**：无法判断连续前缀时，整次按 miss 处理。
 - **Store 连接异常**：由 Mooncake backend 的重连、重注册和熔断逻辑处理；Scheduler 只接收失败结果，不等待重连。
 
-### 2.5 与现有 DeepInfer 入口的接入
+### 2.6 与现有 DeepInfer 入口的接入
 
 当前入口为：
 
