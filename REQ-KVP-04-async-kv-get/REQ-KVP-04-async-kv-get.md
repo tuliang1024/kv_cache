@@ -504,11 +504,19 @@ class KVPoolWorker:
 
 测试用例只描述验证计划，不代表已经执行或通过。
 
-| 用例编号     | 类型 | 测试目的                     | 测试步骤                                                                          | 测试点 / 预期结果                                                                               |
-| ------------ | ---- | ---------------------------- | --------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| TC-KVP-04-01 | 正常 | 验证完整命中异步恢复         | 提交对齐的命中数；保持 Store 未完成；再返回全部 block 成功并执行下一轮 step       | get 期间其他请求继续调度；完成请求进入 `kv_ready` 优先队列并执行 suffix Prefill。             |
-| TC-KVP-04-02 | 正常 | 验证无命中复用原有 Prefill   | 提交 `hit_tokens == 0` 的请求并执行调度                                         | 不分配 prefix block、不生成异步 task，直接走现有 Prefill。                                      |
-| TC-KVP-04-03 | 并发 | 验证优先队列                 | 让一个请求完成 get、另一个请求仍在 `kv_loading`，分别设置 suffix 资源足够和不足 | `kv_ready` 优先处理；资源不足时保持队首。                                                     |
-| TC-KVP-04-04 | 异常 | 验证部分失败和短读回退       | 多 block 请求中间 block 返回短读或失败                                            | 释放本次 Get 的全部 prefix block，命中数清零，请求回到 `waiting` 队头并重新执行全量 Prefill。 |
-| TC-KVP-04-05 | 异常 | 验证整体 miss 与资源清理     | 让 Store 返回请求级失败或首 block 失败                                            | prefix block 释放且不重复释放，命中数清零，请求优先回到 waiting 重新计算。                      |
-| TC-KVP-04-06 | 异常 | 验证取消、重复和过期完成事件 | get 在途时取消请求，再注入完成、重复完成和旧 `load_id` 事件                     | 事件被丢弃，block 只释放一次，不修改已取消或已完成请求。                                        |
+| 用例编号     | 类型 | 测试目的                         | 测试步骤                                                                                           | 测试点 / 预期结果                                                                                                  |
+| ------------ | ---- | -------------------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| TC-KVP-04-01 | 正常 | 验证完整命中和任务元数据         | 提交 block 对齐的 prefix 命中；执行一次 `Scheduler.schedule()`，检查 `kv_load_tasks`；再执行 step | 请求从 `waiting` 进入 `kv_loading`；任务只出现在 `SchedulerOutputs`，未在 Scheduler 中直接调用 Store。            |
+| TC-KVP-04-02 | 正常 | 验证 Connector 到 worker 入队    | 对 04-01 返回的 `kv_load_tasks` 执行 `post_schedule()`                                                | `KVPoolConnector.start_load_kv()` 被调用；任务进入 `KVPoolWorker` 的 Get 线程队列；Engine 不等待 Store 完成。     |
+| TC-KVP-04-03 | 正常 | 验证完整 Get completion 消费      | Get worker 返回所有 block 成功；下一轮 step 开始执行 `poll_completions()` 和 Scheduler 更新             | 校验 `request_id/load_id` 后从 `kv_loading` 移除并进入 `kv_ready`；本轮 completion 处理不执行模型计算。          |
+| TC-KVP-04-04 | 正常 | 验证 kv_ready suffix 成功路径     | `kv_ready` 队头请求设置 suffix block 足够；执行下一轮调度                                          | 先 peek 队头，分配 suffix block 成功；移出 `kv_ready`，加入本轮调度结果并执行 suffix Prefill。                 |
+| TC-KVP-04-05 | 并发 | 验证异步加载期间其他请求继续调度 | 请求 A 处于 `kv_loading`；请求 B 无 prefix 命中；连续执行两轮 step                                  | A 不进入模型计算；B 按现有 waiting 路径执行普通 Prefill；Get 完成前不阻塞 B。                                    |
+| TC-KVP-04-06 | 资源 | 验证 suffix block 不足            | Get 已完整成功并进入 `kv_ready`，但 suffix block 分配失败；下一轮补充资源后重试                       | 请求保留在 `kv_ready`，prefix block 不释放；后续轮次只重试 suffix 分配，成功后再执行 suffix Prefill。          |
+| TC-KVP-04-07 | 资源 | 验证异步 Get 额度达到上限         | 将进行中、已完成待消费和已取消在途数量之和设置为 `max_num_inflight_kv_loads`；提交新的 prefix 命中请求 | 新请求保留在 `waiting`，不分配 prefix block、不生成 `kv_load_task`；额度释放后才允许接纳。                      |
+| TC-KVP-04-08 | 异常 | 验证部分 block 失败和短读回退     | 多 block Get 中间 block 返回 `False` 或短读；下一轮消费 completion                                               | 释放本次 Get 的全部 prefix block，清零命中状态，移出 `kv_ready` 并 `push_front` 回 `waiting`，重新全量 Prefill。 |
+| TC-KVP-04-09 | 异常 | 验证请求级 Get 失败               | Store 返回请求级异常或首 block 失败；执行 completion 消费和下一轮调度                                | 与部分失败相同：block 只释放一次、命中状态清零、请求回到 `waiting` 队头并按 miss 重新计算。                   |
+| TC-KVP-04-10 | 取消 | 验证 waiting/ready 取消           | 分别在 Get 未提交的 `waiting` 和 Get 已完成的 `kv_ready` 取消请求                                     | 从对应队列移除并标记 `FINISHED_ABORTED`；已完成请求立即释放 prefix/suffix 和其他资源。                         |
+| TC-KVP-04-11 | 取消 | 验证 loading 延迟释放             | Get 已入队但未完成时取消；随后让 worker 返回 completion                                              | 请求加入 `aborted_kv_loads`；completion 到达前不复用目标 prefix block；完成后释放一次并清理集合和任务记录。 |
+| TC-KVP-04-12 | 并发 | 验证重复、过期和未知 completion   | 注入重复 completion、旧 `load_id`、未知 request_id 以及取消后的 completion                             | 均被丢弃或仅执行一次延迟清理；不改变新 load 状态，不重复释放 block，不重新入队。                              |
+| TC-KVP-04-13 | 正常 | 验证无池化配置兼容性              | 关闭 Store/KV Pool 配置，提交命中数为 0 的请求并运行现有流程                                       | 不创建 Connector/worker Get 任务；请求完全复用原有 Prefill，原有输出和资源回收行为不变。                     |
+| TC-KVP-04-14 | 异常 | 验证 worker/Store 连接异常        | Get worker 模拟连接断开、超时或 backend 异常；返回失败 completion                                  | worker 发布失败结果不修改 Scheduler 队列；Scheduler 按整体 miss 回退，连接恢复由 Store 层处理。              |
