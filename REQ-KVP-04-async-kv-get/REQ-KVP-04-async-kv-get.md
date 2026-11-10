@@ -37,7 +37,7 @@ vLLM 的远端 KV 流程将“外部 block 分配、异步加载、完成确认�
 5. Store 直接向已注册的 `gpu_blocks` HBM segment 写入数据。
 6. 下一轮 `LLMEngine.step()` 发起 completion poll，Scheduler 主线程校验 `load_id`、请求状态的结果。
 7. 成功请求进入优先处理的 `kv_ready` 队列；suffix block 分配成功后直接进入当前或下一轮 Prefill。
-8. 失败请求按连续有效前缀截短，或整体按 miss 重新 Prefill；后台 Store 未完成前不得释放目标 block。
+8. 失败请求按本方案整体按 miss 重新 Prefill；后台 Store 未完成前不得释放目标 block。
 
 ### 2.2 队列
 
@@ -178,8 +178,8 @@ flowchart TD
 
 ### 2.5 失败、取消和资源不足
 
-- **逐 block 失败**：按 block 顺序保留从第一个 block 开始的连续成功前缀；失败 block 及后续 block 释放并按 miss 计算。
-- **只有请求级结果**：无法判断连续前缀时，整次按 miss 处理。
+- **部分 block 失败**：按本方案将本次异步加载整体视为失败，释放本次 Get 分配的全部 prefix block，清零命中状态，放回 `waiting` 队头并重新申请全量 block 执行 Prefill。
+- **只有请求级结果**：无法判断逐 block 结果时，同样按整体 miss 处理。
 - **Store 连接异常**：由 Mooncake backend 的重连、重注册和熔断逻辑处理；Scheduler 只接收失败结果，不等待重连。
 
 ### 2.6 与现有 DeepInfer 入口的接入
@@ -220,117 +220,295 @@ LLMEngine.step()
 
 ## 4. 关键流程伪代码
 
-### 4.1 Scheduler
+以下伪代码只定义本需求新增的异步 Get 交接，不替换 DeepInfer 现有的普通 Prefill、Decode 和 `process_outputs()` 路径。方法名和字段名表示需要新增或扩展的接口；实际 Store 字节读写仍复用 REQ-KVP-03 的 `MooncakeStoreClient.get()`。
+
+### 4.1 数据对象与 SchedulerOutputs 扩展
+
+```text
+struct KVLoadTask:
+    request_id
+    load_id                         # Scheduler 为每次 load 分配的单调 ID
+    request_token_ids               # 用于 connector 生成 block key
+    prefix_hit_tokens
+    local_block_ids                 # Scheduler 已分配并 pin 的目标 block
+    block_size
+    block_bytes
+    layout_version
+    tenant
+
+struct KVLoadCompletion:
+    request_id
+    load_id
+    block_results: list[bool]       # 与 local_block_ids 等长；短读/异常为 False
+    error: Error | None
+
+struct SchedulerOutputs:
+    # DeepInfer 现有字段保持不变
+    scheduled_seqs
+    finished_seqs
+    prompt_run
+    ...
+
+    # 本需求新增：只描述待提交任务，不执行 I/O
+    kv_load_tasks: list[KVLoadTask]
+```
+
+### 4.2 Scheduler：完成事件、异步接纳和正常调度
 
 ```text
 class Scheduler:
     def apply_kv_completions(self, completions):
-        # 由 LLMEngine.step() 调用；Scheduler 不主动调用 Python worker。
+        # 由 LLMEngine.step() 主线程调用；不调用 KVPoolWorker。
         for completion in completions:
-            seq = self.find_sequence(completion.request_id)
-            if seq is None or seq.kv_load_id != completion.kv_load_id:
-                continue  # 旧事件或重复事件
-            if seq.schedule.status == FINISHED_ABORTED:
-                self.release_loaded_blocks(seq)
-                self.kv_loading.remove(seq)
+            seq = self.requests.get(completion.request_id)
+            if seq is None:
+                continue                         # 请求已清理
+
+            if seq.kv_load_id != completion.load_id:
+                continue                         # 旧事件、重复事件或 load_id 不匹配
+
+            if seq.status == FINISHED_ABORTED:
+                self.release_loaded_prefix_blocks_once(seq)
+                self.kv_loading.remove_if_present(seq)
+                self.aborted_kv_loads.discard(completion.request_id)
                 continue
 
-            valid_blocks = continuous_success_prefix(completion.block_results)
-            if valid_blocks == 0:
-                self.release_loaded_blocks(seq)
-                seq.cache.num_tokens = 0
-                seq.prefix_hit_tokens = 0
-                seq.schedule.status = WAITING
-                self.kv_loading.remove(seq)
-                self.waiting.push_front(seq)  # 完整 miss 优先重新 Prefill
-                continue
-
-            self.truncate_loaded_blocks(seq, valid_blocks)
-            seq.prefix_hit_tokens = valid_blocks * self.block_size
-            seq.schedule.status = WAITING
+            # completion 到达后才允许释放/复用 kv_loading 的目标 block。
+            seq.pending_completion = completion
             self.kv_loading.remove(seq)
-            self.kv_ready.push_back(seq)  # 对应 vLLM kv_holding_waiting
+            self.kv_ready.push_back(seq)
 
-    def admit_kv_loads(self, outputs):
-        for seq in self.waiting:
+    def _admit_waiting_kv_loads(self, outputs):
+        # 只接纳尚未启动异步 Get 的 waiting 请求；无 prefix 命中的请求
+        # 留给 DeepInfer 原有的普通 Prefill 调度，不在这里出队。
+        for seq in list(self.waiting):
             hit_tokens = seq.prefix_hit_tokens_from_upstream
             if hit_tokens == 0:
                 continue
+
             if hit_tokens % self.block_size != 0:
-                self.mark_prefix_miss(seq)
+                # 非 block 对齐命中不能提交异步 block Get，按普通 miss 处理。
+                seq.prefix_hit_tokens_from_upstream = 0
                 continue
 
             block_count = hit_tokens // self.block_size
-            if not self.block_manager.can_allocate_nolock(block_count):
-                break  # 保持 waiting 队首语义
+            if not self._admits_inflight_kv_load():
+                break                            # 当前及后续请求留在 waiting
+            if not self.block_manager.can_allocate(block_count):
+                break                            # 保留 waiting 队头，等待资源
 
-            local_blocks = self.block_manager.allocate_nolock(block_count)
-            self.pin(local_blocks)
-            seq.cache.block_table.assign(local_blocks)
-            seq.cache.num_tokens = hit_tokens
-            seq.prefix_hit_tokens = hit_tokens
+            seq = self.waiting.pop_front()
+            block_ids = self.block_manager.allocate(block_count)
+            self.pin(block_ids)
+
             seq.kv_load_id = self.next_load_id()
-            seq.schedule.status = WAITING_FOR_REMOTE_KVS
-            self.kv_loading.push_back(self.waiting.pop_front())
-            outputs.kv_load_tasks.push_back(self.make_task(seq, local_blocks))
+            seq.prefix_hit_tokens = hit_tokens
+            seq.cache.num_tokens = hit_tokens
+            seq.status = WAITING_FOR_REMOTE_KVS
+            self.kv_loading.push_back(seq)
 
-    def schedule(self, sequence_metadata_pool):
-        # vLLM 的 kv_holding_waiting 语义：ready 请求优先，资源不足时保持队首。
+            outputs.kv_load_tasks.append(
+                KVLoadTask(
+                    request_id=seq.request_id,
+                    load_id=seq.kv_load_id,
+                    request_token_ids=seq.prompt_token_ids,
+                    prefix_hit_tokens=hit_tokens,
+                    local_block_ids=block_ids,
+                    block_size=self.block_size,
+                    block_bytes=self.block_bytes,
+                    layout_version=self.layout_version,
+                    tenant=self.block_tenant,
+                )
+            )
+
+    def _schedule_kv_ready(self, outputs):
         while self.kv_ready:
             seq = self.kv_ready.front()
+            completion = seq.pending_completion
+            assert completion is not None
+
+            if not all(completion.block_results):
+                # 本方案的失败策略：部分成功也整体回退，不使用部分 prefix。
+                self.kv_ready.pop_front()
+                self.release_loaded_prefix_blocks_once(seq)
+                seq.pending_completion = None
+                seq.cache.num_tokens = 0
+                seq.prefix_hit_tokens = 0
+                seq.prefix_hit_tokens_from_upstream = 0
+                seq.status = WAITING
+                self.waiting.push_front(seq)  # 队头，下一轮优先全量 Prefill
+                continue
+
             suffix_blocks = self.required_suffix_blocks(seq)
+            if not self.block_manager.can_allocate(suffix_blocks):
+                break                            # 保留 kv_ready 队头及 prefix block
 
-            self.allocate_suffix_blocks(seq, suffix_blocks)
+            suffix_ids = self.block_manager.allocate(suffix_blocks)
+            seq.cache.block_table.append(suffix_ids)
+            seq.pending_completion = None
             self.kv_ready.pop_front()
-            self.schedule_prefill(seq)
+            self._append_prefill_result(outputs, seq, suffix_ids)
 
+    def schedule(self, sequence_metadata_pool):
         outputs = SchedulerOutputsBuilder()
-        self.admit_kv_loads(outputs)
-        outputs.extend(self.schedule_normal_prefill_or_decode(sequence_metadata_pool))
+        self._schedule_kv_ready(outputs)
+        self._admit_waiting_kv_loads(outputs)
+
+        # 复用 DeepInfer 现有 waiting/running 调度和 SequenceMetadata 构造。
+        outputs.extend(
+            self._schedule_normal_prefill_or_decode(sequence_metadata_pool)
+        )
         return outputs
 
-    # `schedule_prefill` 继续复用现有 chunked-prefill 路径；若 suffix 未在一轮完成，
-    # 请求按原有 chunk 状态在后续轮次继续执行，不重新提交 Store get。
+    def abort(self, request_id):
+        seq = self.requests.get(request_id)
+        if seq is None:
+            return
+
+        self.waiting.remove_if_present(seq)
+        self.kv_ready.remove_if_present(seq)
+
+        if seq in self.kv_loading:
+            self.kv_loading.remove(seq)
+            seq.status = FINISHED_ABORTED
+            self.aborted_kv_loads.add(request_id)
+            # 后台 Get 可能仍在写入，延迟释放目标 prefix block。
+            return
+
+        seq.status = FINISHED_ABORTED
+        self.release_all_blocks(seq)
 ```
 
-### 4.2 KVPoolWorker
+### 4.3 LLMEngine：DeepInfer 主流程接入点
+
+```text
+class LLMEngine:
+    def step(self):
+        # 1. 主线程先消费上一阶段已经完成的异步 Get。
+        completions = self.kv_pool_connector.poll_completions()
+        self.scheduler.apply_kv_completions(completions)
+
+        # 2. C++ Scheduler 生成本轮 metadata 和 kv_load_tasks。
+        seq_metadata_list, scheduler_outputs = self.scheduler.schedule(
+            self.sequence_metadata_pool
+        )
+
+        # 3. 复用现有 post_schedule 扩展点提交异步任务。
+        #    这里只入队，不等待 Store Get，不修改 Scheduler 队列。
+        self.post_schedule(scheduler_outputs)
+
+        # 4. post_schedule 的 KV 部分：
+        #    KVPoolConnector -> KVPoolWorker -> Get thread request queue。
+        #    当前请求已处于 WAITING_FOR_REMOTE_KVS/kv_loading，
+        #    因此不会进入本轮模型计算。
+        request_outputs = self._execute_model_async_step(
+            seq_metadata_list,
+            scheduler_outputs,
+        )
+
+        return request_outputs
+
+    def post_schedule(self, scheduler_outputs):
+        if scheduler_outputs.kv_load_tasks:
+            self.kv_pool_connector.start_load_kv(
+                scheduler_outputs.kv_load_tasks
+            )
+        # 继续执行其他已有 post_schedule 逻辑。
+```
+
+### 4.4 KVPoolConnector：调度元数据和 Worker 的适配层
+
+```text
+class KVPoolConnector:
+    def start_load_kv(self, tasks):
+        # 不调用 Store get；只负责把 Scheduler 任务转换为 worker 任务。
+        for task in tasks:
+            self.worker.submit_load_task(self._build_worker_task(task))
+
+    def poll_completions(self):
+        # 只读取并返回完成事件，不修改 Request 或 Scheduler 状态。
+        return self.worker.drain_completions()
+
+    def _build_worker_task(self, task):
+        return KVPoolWorkerTask(
+            request_id=task.request_id,
+            load_id=task.load_id,
+            token_ids=task.request_token_ids,
+            local_block_ids=task.local_block_ids,
+            block_size=task.block_size,
+            block_bytes=task.block_bytes,
+            layout_version=task.layout_version,
+            tenant=task.tenant,
+        )
+```
+
+### 4.5 KVPoolWorker：后台队列和 Store Get
 
 ```text
 class KVPoolWorker:
-    def submit_load_tasks(self, tasks):
-        for task in tasks:
-            self.get_thread.request_queue.put(task)
+    def __init__(self, store_client, gpu_blocks, rank_info):
+        self.store_client = store_client       # REQ-KVP-03
+        self.gpu_blocks = gpu_blocks           # 已由 REQ-KVP-01 注册
+        self.rank_info = rank_info
+        self.request_queue = Queue()
+        self.completion_queue = Queue()
+        self.get_thread = Thread(target=self._run_get_loop, daemon=True)
 
-    def _get_one_task(self, task):
+    def submit_load_task(self, task):
+        self.request_queue.put(task)
+
+    def _run_get_loop(self):
+        while not self.stopping:
+            task = self.request_queue.get()
+            try:
+                completion = self._execute_get(task)
+                self.completion_queue.put(completion)
+            finally:
+                self.request_queue.task_done()
+
+    def _execute_get(self, task):
         items = []
-        for index, local_block_id in enumerate(task.local_block_ids):
-            # key 在 PE 侧生成；C++ Scheduler 不保存完整 Store key。
-            key = build_store_key(task.request_tokens, task.block_size,
-                                  task.layout_version, self.rank_info, index)
-            address = self.gpu_blocks.data_ptr() + local_block_id * task.block_bytes
-            items.append(GetItem(key, [(address, task.block_bytes)]))
+        for index, block_id in enumerate(task.local_block_ids):
+            key = make_block_key(
+                token_ids=task.token_ids,
+                block_index=index,
+                block_size=task.block_size,
+                layout_version=task.layout_version,
+                rank_info=self.rank_info,
+                tenant=task.tenant,
+            )
+            addr = self.gpu_blocks.data_ptr() + block_id * task.block_bytes
+            items.append(GetItem(key, [(addr, task.block_bytes)]))
 
-        # backend 负责短读、对象不存在、重连和熔断，并返回逐 item 结果。
-        result = self.mooncake_store.get(items)
-        self.completion_queue.put(
-            KVLoadCompletion(task.request_id, task.kv_load_id, result)
-        )
+        try:
+            block_results = self.store_client.get(items)
+            return KVLoadCompletion(
+                request_id=task.request_id,
+                load_id=task.load_id,
+                block_results=block_results,
+                error=None,
+            )
+        except Exception as exc:
+            return KVLoadCompletion(
+                request_id=task.request_id,
+                load_id=task.load_id,
+                block_results=[False] * len(items),
+                error=exc,
+            )
 
-    def poll_completions(self):
-        # 由 KVPoolConnector 调用；这里只读取完成队列，不修改 Scheduler 状态。
+    def drain_completions(self):
         return self.completion_queue.drain()
 ```
-
 
 ## 5. ST 测试用例
 
 测试用例只描述验证计划，不代表已经执行或通过。
 
-| 用例编号     | 类型 | 测试目的                     | 测试步骤                                                                          | 测试点 / 预期结果                                                                          |
-| ------------ | ---- | ---------------------------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| TC-KVP-04-01 | 正常 | 验证完整命中异步恢复         | 提交对齐的命中数；保持 Store 未完成；再返回全部 block 成功并执行下一轮 step       | get 期间其他请求继续调度；完成请求进入 `kv_ready` 优先队列并执行 suffix Prefill。        |
-| TC-KVP-04-02 | 正常 | 验证无命中复用原有 Prefill   | 提交 `hit_tokens == 0` 的请求并执行调度                                         | 不分配 prefix block、不生成异步 task，直接走现有 Prefill。                                 |
-| TC-KVP-04-03 | 并发 | 验证优先队列      | 让一个请求完成 get、另一个请求仍在 `kv_loading`，分别设置 suffix 资源足够和不足 | `kv_ready` 优先处理；资源不足时保持队首。 |
-| TC-KVP-04-04 | 异常 | 验证部分失败和短读回退       | 多 block 请求中间 block 返回短读或失败                                            | 只保留连续有效前缀，后续 token 走普通 Prefill；不使用失败 block 后的数据。                 |
-| TC-KVP-04-05 | 异常 | 验证整体 miss 与资源清理     | 让 Store 返回请求级失败或首 block 失败                                            | prefix block 释放且不重复释放，命中数清零，请求优先回到 waiting 重新计算。                 |
-| TC-KVP-04-06 | 异常 | 验证取消、重复和过期完成事件 | get 在途时取消请求，再注入完成、重复完成和旧 `load_id` 事件                     | 事件被丢弃，block 只释放一次，不修改已取消或已完成请求。                                   |
+| 用例编号     | 类型 | 测试目的                     | 测试步骤                                                                          | 测试点 / 预期结果                                                                               |
+| ------------ | ---- | ---------------------------- | --------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| TC-KVP-04-01 | 正常 | 验证完整命中异步恢复         | 提交对齐的命中数；保持 Store 未完成；再返回全部 block 成功并执行下一轮 step       | get 期间其他请求继续调度；完成请求进入 `kv_ready` 优先队列并执行 suffix Prefill。             |
+| TC-KVP-04-02 | 正常 | 验证无命中复用原有 Prefill   | 提交 `hit_tokens == 0` 的请求并执行调度                                         | 不分配 prefix block、不生成异步 task，直接走现有 Prefill。                                      |
+| TC-KVP-04-03 | 并发 | 验证优先队列                 | 让一个请求完成 get、另一个请求仍在 `kv_loading`，分别设置 suffix 资源足够和不足 | `kv_ready` 优先处理；资源不足时保持队首。                                                     |
+| TC-KVP-04-04 | 异常 | 验证部分失败和短读回退       | 多 block 请求中间 block 返回短读或失败                                            | 释放本次 Get 的全部 prefix block，命中数清零，请求回到 `waiting` 队头并重新执行全量 Prefill。 |
+| TC-KVP-04-05 | 异常 | 验证整体 miss 与资源清理     | 让 Store 返回请求级失败或首 block 失败                                            | prefix block 释放且不重复释放，命中数清零，请求优先回到 waiting 重新计算。                      |
+| TC-KVP-04-06 | 异常 | 验证取消、重复和过期完成事件 | get 在途时取消请求，再注入完成、重复完成和旧 `load_id` 事件                     | 事件被丢弃，block 只释放一次，不修改已取消或已完成请求。                                        |
