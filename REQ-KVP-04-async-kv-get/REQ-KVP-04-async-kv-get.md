@@ -55,11 +55,12 @@ kv_ready      Store Get 已完成，等待应用 completion 和 suffix block 分
 
 每次 `Scheduler.schedule()` 在一个循环中按以下顺序选择请求：
 
-1. 优先扫描 `kv_ready`：查看队首请求，直接计算 suffix block 数并尝试分配；completion 已在请求进入 `kv_ready` 前由 Scheduler 主线程校验并应用。
-2. suffix block 分配成功时，从 `kv_ready` 移除请求，加入本轮调度结果并执行 suffix Prefill，该请求的本轮处理结束。
-3. suffix block 分配失败时，不移除请求，不释放已应用的 prefix block；本轮跳过或结束 `kv_ready` 扫描，下一轮只重试 suffix block 分配。
-4. `kv_ready` 当前为空或本轮资源不允许继续处理时，处理 `waiting`：没有 prefix 命中则按现有路径执行普通 Prefill；有 prefix 命中则检查 inflight Get 额度，额度足够时分配 prefix block、生成并提交 Get task，再将请求移入 `kv_loading`；额度不足时保留在 `waiting`，不分配 prefix block，也不提交 Get。
-5. `kv_loading` 中的请求不参与模型计算。Get 完成后由 Scheduler 主线程应用完成事件并转入 `kv_ready`，不得在 worker 线程直接操作 Scheduler 队列。
+1. 优先扫描 `kv_ready`：查看队首请求，先检查 completion 是否为完整成功；只有完整成功时才计算 suffix block 数并尝试分配。completion 已在请求进入 `kv_ready` 前由 Scheduler 主线程校验并应用。
+2. 按本方案的失败策略，如果 completion 只有部分 block 成功，或请求级 Get 失败，则将本次异步加载视为整体无效：释放本次异步 Get 分配的全部 prefix block，清零 prefix 命中和已加载 token 状态，从 `kv_ready` 移除并使用 `push_front` 放回 `waiting` 队头；下一次调度按无 prefix 命中的普通路径重新申请全量 block 并执行完整 Prefill，不继续使用部分 prefix。vLLM 对逐 block `invalid_block_ids` 另有保留连续有效前缀的处理；本方案选择全量重算以简化 DeepInfer 的失败恢复路径。
+3. completion 完整成功且 suffix block 分配成功时，从 `kv_ready` 移除请求，加入本轮调度结果并执行 suffix Prefill，该请求的本轮处理结束。
+4. completion 完整成功但 suffix block 分配失败时，不移除请求，不释放已应用的 prefix block；本轮跳过或结束 `kv_ready` 扫描，下一轮只重试 suffix block 分配。
+5. `kv_ready` 当前为空或本轮资源不允许继续处理时，处理 `waiting`：没有 prefix 命中则按现有路径执行普通 Prefill；有 prefix 命中则检查 inflight Get 额度，额度足够时分配 prefix block、生成并提交 Get task，再将请求移入 `kv_loading`；额度不足时保留在 `waiting`，不分配 prefix block，也不提交 Get。
+6. `kv_loading` 中的请求不参与模型计算。Get 完成后由 Scheduler 主线程应用完成事件并转入 `kv_ready`，不得在 worker 线程直接操作 Scheduler 队列。
 
 单轮队列选择和转换如下：
 
@@ -67,26 +68,29 @@ kv_ready      Store Get 已完成，等待应用 completion 和 suffix block 分
 flowchart TD
     A[Scheduler.schedule 循环] --> B{kv_ready 非空且资源允许?}
     B -->|是| C[peek kv_ready 队首]
-    C --> F[计算 suffix block 数]
-    F --> G{suffix block 分配成功?}
-    G -->|是| H[从 kv_ready 移除\n加入本轮调度结果\n执行 suffix Prefill\n本轮处理结束]
-    G -->|否| I[保留在 kv_ready\n不释放 prefix block\n本轮跳过或结束该队列扫描]
-    I --> J[下一轮重试 suffix block]
+    C --> D{completion 完整成功?}
+    D -->|否：部分 block 成功或 Get 失败| E[释放本次 Get 的全部 prefix block\n清零 prefix 命中和已加载 token\n从 kv_ready 移除\npush_front 放回 waiting 队头]
+    E --> F[下一轮按无 prefix 命中\n重新申请全量 block\n执行完整 Prefill]
+    D -->|是| G[计算 suffix block 数]
+    G --> H{suffix block 分配成功?}
+    H -->|是| I[从 kv_ready 移除\n加入本轮调度结果\n执行 suffix Prefill\n本轮处理结束]
+    H -->|否| J[保留在 kv_ready\n不释放 prefix block\n本轮跳过或结束该队列扫描]
+    J --> K[下一轮重试 suffix block]
 
-    B -->|否| K[从 waiting 取请求]
-    K --> L{prefix 命中?}
-    L -->|否| M[按现有路径分配 block\n执行普通 Prefill\n进入 running/本轮调度结果\n本轮处理结束]
-    L -->|是| N{inflight Get 额度足够?}
-    N -->|否| O[请求保留在 waiting\n不分配 prefix block\n不提交 Get]
-    O --> P[继续本轮其他可调度检查\n或下一轮重试]
-    N -->|是| Q[分配 prefix block\n构造并提交异步 Get task]
-    Q --> R[移入 kv_loading\n本轮不执行模型计算]
-    R --> A
+    B -->|否| L[从 waiting 取请求]
+    L --> M{prefix 命中?}
+    M -->|否| N[按现有路径分配 block\n执行普通 Prefill\n进入 running/本轮调度结果\n本轮处理结束]
+    M -->|是| O{inflight Get 额度足够?}
+    O -->|否| P[请求保留在 waiting\n不分配 prefix block\n不提交 Get]
+    P --> Q[继续本轮其他可调度检查\n或下一轮重试]
+    O -->|是| R[分配 prefix block\n构造并提交异步 Get task]
+    R --> S[移入 kv_loading\n本轮不执行模型计算]
+    S --> A
 
-    S[worker 完成异步 Get] --> T[产生 completion 事件]
-    T --> U[下一次 LLMEngine.step\nScheduler 主线程应用事件]
-    U --> V[从 kv_loading 移除\n转入 kv_ready]
-    V --> A
+    W[worker 完成异步 Get] --> X[产生 completion 事件]
+    X --> Y[下一次 LLMEngine.step\nScheduler 主线程应用事件]
+    Y --> Z[从 kv_loading 移除\n转入 kv_ready]
+    Z --> A
 ```
 
 ### 2.3 异步 Get 完成与 Scheduler 消费
