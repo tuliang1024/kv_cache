@@ -41,20 +41,97 @@ vLLM 的远端 KV 流程将“外部 block 分配、异步加载、完成确认�
 
 ### 2.2 队列
 
-新增两个 Scheduler 专用队列：
+本方案借鉴 vLLM Scheduler 的多流队列设计，参考
+[vllm/v1/core/sched/scheduler.py](https://github.com/vllm-project/vllm/blob/main/vllm/v1/core/sched/scheduler.py)。
+DeepInfer 保留现有 `waiting` 队列，并新增两个由 Scheduler 主线程维护的队列：
 
 ```text
-kv_loading    prefix block 已分配，Store get 进行中
-kv_ready      Store get 已完成，等待 suffix block 分配
+waiting       新请求或尚未启动 KV Get 的请求
+kv_loading    prefix block 已分配，Store Get 已提交但尚未完成
+kv_ready      Store Get 已完成，等待应用 completion 和 suffix block 分配
 ```
 
-### 2.3 失败、取消和资源不足
+`kv_loading` 不参与模型计算。后台 worker 只提交 Store Get 并产生完成事件，不直接修改上述队列；完成事件由下一次 `LLMEngine.step()` 在 Scheduler 主线程中应用，将请求从 `kv_loading` 转入 `kv_ready`。
+
+每次 `Scheduler.schedule()` 在一个循环中按以下顺序选择请求：
+
+1. 优先扫描 `kv_ready`：查看队首请求，直接计算 suffix block 数并尝试分配；completion 已在请求进入 `kv_ready` 前由 Scheduler 主线程校验并应用。
+2. suffix block 分配成功时，从 `kv_ready` 移除请求，加入本轮调度结果并执行 suffix Prefill，该请求的本轮处理结束。
+3. suffix block 分配失败时，不移除请求，不释放已应用的 prefix block；本轮跳过或结束 `kv_ready` 扫描，下一轮只重试 suffix block 分配。
+4. `kv_ready` 当前为空或本轮资源不允许继续处理时，处理 `waiting`：没有 prefix 命中则按现有路径执行普通 Prefill；有 prefix 命中则检查 inflight Get 额度，额度足够时分配 prefix block、生成并提交 Get task，再将请求移入 `kv_loading`；额度不足时保留在 `waiting`，不分配 prefix block，也不提交 Get。
+5. `kv_loading` 中的请求不参与模型计算。Get 完成后由 Scheduler 主线程应用完成事件并转入 `kv_ready`，不得在 worker 线程直接操作 Scheduler 队列。
+
+单轮队列选择和转换如下：
+
+```mermaid
+flowchart TD
+    A[Scheduler.schedule 循环] --> B{kv_ready 非空且资源允许?}
+    B -->|是| C[peek kv_ready 队首]
+    C --> F[计算 suffix block 数]
+    F --> G{suffix block 分配成功?}
+    G -->|是| H[从 kv_ready 移除\n加入本轮调度结果\n执行 suffix Prefill\n本轮处理结束]
+    G -->|否| I[保留在 kv_ready\n不释放 prefix block\n本轮跳过或结束该队列扫描]
+    I --> J[下一轮重试 suffix block]
+
+    B -->|否| K[从 waiting 取请求]
+    K --> L{prefix 命中?}
+    L -->|否| M[按现有路径分配 block\n执行普通 Prefill\n进入 running/本轮调度结果\n本轮处理结束]
+    L -->|是| N{inflight Get 额度足够?}
+    N -->|否| O[请求保留在 waiting\n不分配 prefix block\n不提交 Get]
+    O --> P[继续本轮其他可调度检查\n或下一轮重试]
+    N -->|是| Q[分配 prefix block\n构造并提交异步 Get task]
+    Q --> R[移入 kv_loading\n本轮不执行模型计算]
+    R --> A
+
+    S[worker 完成异步 Get] --> T[产生 completion 事件]
+    T --> U[下一次 LLMEngine.step\nScheduler 主线程应用事件]
+    U --> V[从 kv_loading 移除\n转入 kv_ready]
+    V --> A
+```
+
+### 2.3 Get 额度与取消处理
+
+#### 2.3.1 Get 额度
+
+Scheduler 使用 `max_num_inflight_kv_loads` 限制同时占用的异步 Get 额度。新请求只有在下面的数量之和小于该上限时，才可以分配 prefix block 并提交异步 Get：
+
+```text
+正在进行的 KV Load 数量
++ 已完成但 Scheduler 尚未处理的 KV Load 数量
++ 已取消但底层传输可能仍在途的 KV Load 数量
+< max_num_inflight_kv_loads
+```
+
+其中，`aborted_kv_loads` 只记录已经取消、但底层 Get 尚未确认结束的请求或任务 ID。它们仍占用 Get 额度，直到 completion 到达或底层任务明确结束后才从集合移除并释放目标 block。
+
+#### 2.3.2 取消和资源释放
+
+取消请求时，Scheduler 主线程先从 `waiting`、`kv_loading` 和 `kv_ready` 中移除请求，再标记 `FINISHED_ABORTED`：
+
+```mermaid
+flowchart TD
+    A[abort request_id] --> B[从 waiting / kv_loading / kv_ready 移除]
+    B --> C[标记 FINISHED_ABORTED]
+    C --> D{请求所在阶段}
+
+    D -->|kv_ready| E[Get 已完成\n直接释放 prefix block、suffix block\n和其他请求资源]
+    E --> F[清理请求和任务记录]
+
+    D -->|kv_loading| G[Get 仍可能在途\n不立即释放目标 prefix block]
+    G --> H[加入 aborted_kv_loads]
+    H --> I[等待 completion 或底层结束事件]
+    I --> J[释放 prefix block\n清理任务记录\n从 aborted_kv_loads 移除]
+```
+
+`kv_ready` 中的请求已经完成 Get，因此可以立即释放已加载的 prefix block；`kv_loading` 中的请求可能仍有后台线程向目标 block 写入，必须延迟释放，避免后台传输访问已被复用的 block。
+
+### 2.4 失败、取消和资源不足
 
 - **逐 block 失败**：按 block 顺序保留从第一个 block 开始的连续成功前缀；失败 block 及后续 block 释放并按 miss 计算。
 - **只有请求级结果**：无法判断连续前缀时，整次按 miss 处理。
 - **Store 连接异常**：由 Mooncake backend 的重连、重注册和熔断逻辑处理；Scheduler 只接收失败结果，不等待重连。
 
-### 2.4 与现有 DeepInfer 入口的接入
+### 2.5 与现有 DeepInfer 入口的接入
 
 当前入口为：
 
