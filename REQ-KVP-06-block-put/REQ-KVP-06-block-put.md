@@ -18,7 +18,7 @@ DeepInfer 的 KV block 写入 Mooncake Store 需要与模型执行并行，且 S
 - Prefill 结束时，一次性异步写入全部完整 block。
 - Decode 期间不按 block 边界提交 Put；请求全部 Decode 结束并完成最终 token 记账后，一次性提交该请求尚未写入 Store 的全部完整 block。
 - 未满 block 不作为独立 Store 对象写入；同一请求继续生成后填满该 block，再按完整 block 提交。
-- 通过 `pin_blocks`/`unpin_blocks` 保证 Put 期间 HBM block 不被复用。
+- 通过 `pin_blocks`/`free_blocks`（Put 引用释放）保证 Put 期间 HBM block 不被复用。
 - Put 失败不阻塞推理，失败 block 后续按 cache miss 处理。
 
 ## 2. 设计说明
@@ -42,7 +42,7 @@ Decode 期间只更新 GPU KV cache，不提交 Put。请求在 `process_outputs
 3. Engine 创建 `PutTask`，携带 key、HBM 地址、长度、block ID 和 GPU 写入完成 event，提交到 `KVPoolWorker`。
 4. worker 等待“KV 写入完成事件”后调用 Mooncake Store `put`，不修改 `Sequence` 或 Scheduler 状态。
 5. worker 将 `PutCompletion` 写入完成队列；成功、失败和异常都必须产生完成结果。
-6. Engine 在下一次 step 的 completion poll 中消费结果，并调用 `unpin_blocks()`。
+6. Engine 在下一次 step 的 completion poll 中消费结果，并调用 `free_blocks(block_ids)` 释放 Put 引用；引用计数归零时 block 自动回到 free list。
 7. Scheduler 可以在 Put 进行期间释放请求自身的 block 引用；Put task 的引用独立保留，直到 completion 被消费。
 
 ### 2.3 HBM 生命周期
@@ -58,7 +58,7 @@ Put 引用：PutTask 提交前 pin 产生
 
 ```text
 finalize_seq() -> free_seq() -> 释放 request 引用
-Put 完成      -> unpin_blocks() -> 释放 Put 引用
+Put 完成      -> free_blocks(block_ids) -> 释放 Put 引用 -> ref_count == 0 时回到 free list
 ```
 
 `PutTask` 必须保存独立的 `block_ids` 快照，不能异步读取 `seq.cache.block_table`。DeepInfer 的 `free_seq_nolock()` 会释放并清空该表，见 `DeepInfer/csrc/engine/scheduler.hpp`。
@@ -89,10 +89,10 @@ Decode 不在 `pre_sampler_sync()` 中按 block 边界提交 Put。`pre_sampler_
 `LLMEngine.step()` 在调用 `Scheduler.schedule()` 前执行：
 
 ```text
-completions = kv_pool_worker.poll_put_completions()
+completions = kv_pool_connector.poll_put_completions()
 for completion in completions:
     if completion.task_id 未处理:
-        block_manager.unpin_blocks(completion.block_ids)
+        block_manager.free_blocks(completion.block_ids)
         标记 task 完成
 ```
 
@@ -100,84 +100,78 @@ for completion in completions:
 
 ## 4. 关键流程伪代码
 
-### 4.1 LLMEngine 保存钩子
+以下伪代码沿用 REQ-KVP-04 的分层结构。`LLMEngine` 负责确定 Put 时机和 block 生命周期，`KVPoolConnector` 负责任务适配，`KVPoolWorker` 负责后台队列和 Store 调用。
+
+### 4.1 Put 数据对象
+
+```text
+struct PoolPutTask:
+    task_id
+    request_id
+    tenant
+    keys
+    addrs
+    sizes
+    block_ids                 # 独立快照，不能异步读取 seq.block_table
+    start_block
+    end_block
+    kind
+    replica_config
+    kv_write_done_event
+
+struct PutCompletion:
+    task_id
+    request_id
+    block_ids
+    block_results: list[bool]
+    error: Error | None
+```
+
+### 4.2 LLMEngine：确定 Put 时机和 block 生命周期
 
 ```text
 class LLMEngine:
     def pre_sampler_sync(self, scheduler_outputs):
-        # Decode 不在这里提交 Put：当前轮 token 尚未经过 process_outputs
-        # 记账。这里保留 DeepInfer 原有同步和其他 pre-sampler 逻辑。
+        # Decode 不在这里提交 Put。当前轮 token 还没有经过
+        # scheduler.process_outputs() 最终记账。
         for seq in scheduler_outputs.finished_seqs:
             self.finalize_seq(seq)
 
     def post_process(self, step_state):
         output = step_state.sampler_output
-        if step_state.scheduler_outputs.prompt_run:
-            request_outputs = self._process_model_outputs(
-                output, step_state.scheduler_outputs
-            )
-            self.pe_do_save_kvcache(
-                step_state.scheduler_outputs.scheduled_seqs
-            )
-            return request_outputs
+        scheduler_outputs = step_state.scheduler_outputs
 
-        # Decode 必须先完成 process_outputs，才能看到当前轮最终 token、
-        # cache.num_tokens 和 FINISHED_* 状态。
+        # 先完成 process_outputs，更新 cache.num_tokens 和 FINISHED_* 状态。
         request_outputs = self._process_model_outputs(
-            output, step_state.scheduler_outputs
+            output,
+            scheduler_outputs,
         )
-        self.submit_final_decode_puts(
-            step_state.scheduler_outputs.scheduled_seqs
-        )
+
+        if scheduler_outputs.prompt_run:
+            self.submit_prefill_puts(scheduler_outputs.scheduled_seqs)
+        else:
+            # 只检查本轮刚完成的请求；finished_seqs 属于前一阶段已完成请求。
+            self.submit_final_decode_puts(scheduler_outputs.scheduled_seqs)
+
         return request_outputs
 
-    def pe_do_save_kvcache(self, seqs):
-        # 普通 Prefill 一次完成；chunked_rest_len 保留为防御性检查。
+    def submit_prefill_puts(self, seqs):
         for seq in seqs:
             if seq.chunked_rest_len != 0:
                 continue
 
-            block_size = seq.block_size
-            full_blocks = seq.num_cached_tokens // block_size
-            if full_blocks == 0:
+            full_blocks = seq.cache.num_tokens // self.block_size
+            start = seq.next_unsaved_block
+            if full_blocks <= start:
                 continue
 
-            block_ids = list(
-                connector.block_table_of(seq)[:full_blocks]
-            )
-            if not block_ids:
-                continue
-
-            # request 引用可能在本轮 post_process 后释放；Put 引用必须独立保留。
-            self.block_manager.pin_blocks(block_ids)
-
-            task = PoolPutTask(
-                task_id=self.next_put_task_id(),
-                tenant=self.cfg.block_tenant,
-                keys=make_block_keys(
-                    seq.prompt_token_ids,
-                    full_blocks * block_size,
-                ),
-                addrs=[
-                    self.gpu_blocks_ptr + bid * self.block_bytes
-                    for bid in block_ids
-                ],
-                sizes=[self.block_bytes] * full_blocks,
-                block_ids=block_ids,
-                kind="block",
-                rep=self.cfg.block_rep,
-                kv_write_done_event=record_current_device_event(),
-            )
-            self.pending_put_tasks[task.task_id] = task
-            self.kv_pool_worker.submit_put(task)
-
-            # Prefill 已提交到 full_blocks；Decode 结束时从这里继续提交，
-            # 避免重复写入 Prefill 已经完成的 block。
+            block_ids = copy(seq.cache.block_table[start:full_blocks])
+            self._submit_put_task(seq, block_ids, start, full_blocks)
             seq.next_unsaved_block = full_blocks
 
     def submit_final_decode_puts(self, seqs):
-        # 必须在 _process_model_outputs() 之后调用；此时 cache.num_tokens
-        # 已包含当前 Decode step 实际接受的 token。
+        # 此时 cache.num_tokens 已包含当前 Decode step 实际接受的 token。
+        # Prefill 尾部未满 block 会在这里与 Decode token 合并后提交。
         for seq in seqs:
             if not seq.is_finished():
                 continue
@@ -187,78 +181,154 @@ class LLMEngine:
             if full_blocks <= start:
                 continue
 
-            block_ids = list(seq.cache.block_table[start:full_blocks])
+            block_ids = copy(seq.cache.block_table[start:full_blocks])
             if len(block_ids) != full_blocks - start:
-                raise RuntimeError("block table shorter than final full block count")
+                raise RuntimeError("block table shorter than full block count")
 
-            self.block_manager.pin_blocks(block_ids)
-            task = PoolPutTask(
-                task_id=self.next_put_task_id(),
-                tenant=self.cfg.block_tenant,
-                keys=make_block_keys(
-                    seq.prompt_token_ids,
-                    full_blocks * self.block_size,
-                    start_block=start,
-                ),
-                addrs=[
-                    self.gpu_blocks_ptr + bid * self.block_bytes
-                    for bid in block_ids
-                ],
-                sizes=[self.block_bytes] * len(block_ids),
-                block_ids=block_ids,
-                kind="block",
-                rep=self.cfg.block_rep,
-                kv_write_done_event=record_current_device_event(),
-            )
-            self.pending_put_tasks[task.task_id] = task
-            self.kv_pool_worker.submit_put(task)
+            self._submit_put_task(seq, block_ids, start, full_blocks)
             seq.next_unsaved_block = full_blocks
+
+    def _submit_put_task(self, seq, block_ids, start_block, end_block):
+        if not block_ids:
+            return
+
+        # request 引用可能随后由 free_seq() 释放；先增加 Put 引用。
+        self.block_manager.pin_blocks(block_ids)
+
+        task = PoolPutTask(
+            task_id=self.next_put_task_id(),
+            request_id=seq.request_id,
+            tenant=self.cfg.block_tenant,
+            keys=make_block_keys(
+                seq.prompt_token_ids,
+                start_block=start_block,
+                end_block=end_block,
+                block_size=self.block_size,
+                layout_version=self.cfg.layout_version,
+            ),
+            addrs=[
+                self.gpu_blocks_ptr + bid * self.block_bytes
+                for bid in block_ids
+            ],
+            sizes=[self.block_bytes] * len(block_ids),
+            block_ids=copy(block_ids),
+            start_block=start_block,
+            end_block=end_block,
+            kind="block",
+            replica_config=self.cfg.block_rep,
+            kv_write_done_event=record_kv_write_event(),
+        )
+        self.pending_put_tasks[task.task_id] = task
+        self.kv_pool_connector.start_put([task])
+
+    def apply_put_completions(self, completions):
+        for completion in completions:
+            task = self.pending_put_tasks.pop(completion.task_id, None)
+            if task is None:
+                continue
+
+            # DeepInfer 当前没有独立 unpin_blocks()；free_blocks() 会减少
+            # Put 引用，ref_count == 0 时自动回到 free list。
+            self.block_manager.free_blocks(completion.block_ids)
 ```
 
-### 4.2 `KVPoolWorker` Put 执行
+### 4.3 KVPoolConnector：Engine 与 Worker 的适配层
+
+```text
+class KVPoolConnector:
+    def start_put(self, tasks):
+        for task in tasks:
+            self.worker.submit_put_task(
+                self._build_worker_task(task)
+            )
+
+    def poll_put_completions(self):
+        # 只读取 completion，不修改 Sequence 或 BlockManager。
+        return self.worker.drain_put_completions()
+
+    def _build_worker_task(self, task):
+        return KVPoolWorkerTask(
+            task_id=task.task_id,
+            request_id=task.request_id,
+            tenant=task.tenant,
+            keys=task.keys,
+            addrs=task.addrs,
+            sizes=task.sizes,
+            block_ids=task.block_ids,
+            replica_config=task.replica_config,
+            kv_write_done_event=task.kv_write_done_event,
+        )
+```
+
+### 4.4 KVPoolWorker：后台 Put 队列和 Store 操作
 
 ```text
 class KVPoolWorker:
-    def submit_put(self, task):
-        put_queue.put(task)
+    def __init__(self, store_client):
+        self.store_client = store_client       # REQ-KVP-03
+        self.put_request_queue = Queue()
+        self.put_completion_queue = Queue()
 
-    def run_put_task(self, task):
+    def submit_put_task(self, task):
+        self.put_request_queue.put(task)
+
+    def put_loop(self):
+        while not self.stopping:
+            task = self.put_request_queue.get()
+            try:
+                self.put_completion_queue.put(
+                    self._execute_put(task)
+                )
+            finally:
+                self.put_request_queue.task_done()
+
+    def _execute_put(self, task):
         try:
-            # ready_event 必须由模型 KV 写入 stream 在最后一次 KV 写入之后记录。
-            # 这里只阻塞 Put worker，确保 Store 读取 HBM 时源 block 已经稳定。
+            # 等待最后一次 GPU KV 写入完成，避免 Store 读取未完成数据。
             task.kv_write_done_event.synchronize()
+
             items = [
-                PutItem(key=key, segments=[(addr, size)])
+                PutItem(
+                    key=key,
+                    segments=[(addr, size)],
+                )
                 for key, addr, size in zip(
-                    task.keys, task.addrs, task.sizes, strict=True
+                    task.keys,
+                    task.addrs,
+                    task.sizes,
+                    strict=True,
                 )
             ]
-            # 复用上游 MooncakeStoreClient.put(items)；client 内部调用
-            # batch_put_from_multi_buffers，并将底层 0/-705 归一为成功布尔值。
-            result = mooncake_store.put(items)
-        except Exception as error:
-            result = PutFailure(error)
-        completion_queue.put(PutCompletion(task.task_id, task.block_ids, result))
+            results = self.store_client.put(items)
+            return PutCompletion(
+                task_id=task.task_id,
+                request_id=task.request_id,
+                block_ids=task.block_ids,
+                block_results=results,
+                error=None,
+            )
+        except Exception as exc:
+            return PutCompletion(
+                task_id=task.task_id,
+                request_id=task.request_id,
+                block_ids=task.block_ids,
+                block_results=[False] * len(task.block_ids),
+                error=exc,
+            )
 
-    def poll_put_completions(self):
-        completions = []
-        for completion in completion_queue.drain():
-            task = pending_tasks.remove(completion.task_id)
-            if task is None:
-                continue
-            completions.append(completion)
-        return completions
+    def drain_put_completions(self):
+        return self.put_completion_queue.drain()
 ```
 
-`LLMEngine` 在调用 `KVPoolWorker.submit_put()` 前完成以下动作：复制 `block_ids`、调用 `pin_blocks()`、构造 key/address/size，并将 task 放入 pending 表。`KVPoolWorker` 不直接修改 `BlockManager` 或 `Sequence`。
+`KVPoolWorker` 不直接修改 `Sequence`、`Scheduler` 或 `BlockManager`。Put completion 返回主线程后，由 `LLMEngine.apply_put_completions()` 调用 `free_blocks(block_ids)` 释放 Put 引用；当引用计数归零时，DeepInfer 的 `BlockManager` 自动将 block 放回 free list。
 
 ## 5. 测试用例
 
-| 用例编号     | 类型     | 测试目的                    | 前置条件                            | 步骤                                       | 预期结果                                                            |
-| ------------ | -------- | --------------------------- | ----------------------------------- | ------------------------------------------ | ------------------------------------------------------------------- |
-| TC-KVP-06-01 | 正常     | 普通 Prefill 写入完整 block | prompt 长度为 block size 的整数倍   | 执行一次 Prefill 并检查 Store              | 只提交一次 Put，block pin 在完成前保持，完成后 unpin。              |
-| TC-KVP-06-02 | 边界     | Prefill 尾部与 Decode 合并 | prompt 长度不是 block size 的整数倍 | Prefill 后保留未满尾 block，继续 Decode 直至该 block 填满并结束请求 | Prefill 尾部不单独 Put；请求结束时与 Decode token 合并成完整 block，只提交一次。 |
-| TC-KVP-06-03 | 正常     | Decode 结束一次性写入      | Decode 跨越多个 block 边界          | Decode 期间不提交 Put；结束后执行 `process_outputs()` 和最终 Put 检查       | 一次提交所有尚未提交的完整 block；未满尾 block 不提交；不重复提交 Prefill block。 |
-| TC-KVP-06-04 | 生命周期 | 最终 Put 与请求释放并行    | Put worker 延迟完成                 | 请求完成后先提交最终 Put，再触发 `finalize_seq()`                          | request 引用释放后，Put 引用仍保持；完成后 block 才回到 free list。           |
-| TC-KVP-06-05 | 异常     | Store 失败清理              | Store.put 返回失败或抛异常          | 注入失败并执行 completion poll             | 推理继续；任务记录失败；所有 pin 均释放。                           |
-| TC-KVP-06-06 | 并发     | 多请求 Put 并发             | 两个请求同时产生完整 block          | 同时提交任务并延迟不同完成时间             | task 独立完成和 unpin，不发生 block 误释放。                        |
+| 用例编号     | 类型     | 测试目的                    | 前置条件                            | 步骤                                                                    | 预期结果                                                                          |
+| ------------ | -------- | --------------------------- | ----------------------------------- | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| TC-KVP-06-01 | 正常     | 普通 Prefill 写入完整 block | prompt 长度为 block size 的整数倍   | 执行一次 Prefill 并检查 Store                                           | 只提交一次 Put，block pin 在完成前保持，完成后 unpin。                            |
+| TC-KVP-06-02 | 边界     | Prefill 尾部与 Decode 合并  | prompt 长度不是 block size 的整数倍 | Prefill 后保留未满尾 block，继续 Decode 直至该 block 填满并结束请求     | Prefill 尾部不单独 Put；请求结束时与 Decode token 合并成完整 block，只提交一次。  |
+| TC-KVP-06-03 | 正常     | Decode 结束一次性写入       | Decode 跨越多个 block 边界          | Decode 期间不提交 Put；结束后执行 `process_outputs()` 和最终 Put 检查 | 一次提交所有尚未提交的完整 block；未满尾 block 不提交；不重复提交 Prefill block。 |
+| TC-KVP-06-04 | 生命周期 | 最终 Put 与请求释放并行     | Put worker 延迟完成                 | 请求完成后先提交最终 Put，再触发 `finalize_seq()`                     | request 引用释放后，Put 引用仍保持；完成后 block 才回到 free list。               |
+| TC-KVP-06-05 | 异常     | Store 失败清理              | Store.put 返回失败或抛异常          | 注入失败并执行 completion poll                                          | 推理继续；任务记录失败；所有 pin 均释放。                                         |
+| TC-KVP-06-06 | 并发     | 多请求 Put 并发             | 两个请求同时产生完整 block          | 同时提交任务并延迟不同完成时间                                          | task 独立完成和 unpin，不发生 block 误释放。                                      |
