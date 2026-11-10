@@ -95,43 +95,50 @@ flowchart TD
 
 ### 2.3 异步 Get 完成与 Scheduler 消费
 
-异步 Get 的后台线程不直接修改请求状态，也不直接操作 Scheduler 队列。它只负责从线程任务队列取出 `KVLoadTask`，执行 Mooncake Store `get`，将数据写入预先分配的 prefix block，并记录该任务的完成结果。vLLM 的对应实现中，worker 线程将完成的请求 ID 放入线程安全的完成集合；DeepInfer 采用等价的完成事件队列，事件至少包含 `request_id`、`load_id`、成功/失败状态、已完成 block 信息和错误信息。
+Scheduler 不直接调用 Mooncake，也不直接把任务放入后台线程队列。Scheduler 只将待加载任务作为本地 `SchedulerOutputs` 的元数据输出，例如 `kv_load_tasks`。DeepInfer 在 `LLMEngine.step()` 中、`Scheduler.schedule()` 返回之后且进入 `_execute_model_async_step()` 之前，通过现有的 `post_schedule(scheduler_outputs)` 扩展点调用新增的 `KVPoolConnector.start_load_kv(scheduler_outputs.kv_load_tasks)`。这个位置对应 vLLM 将 `SchedulerOutput` 交给 Worker/Connector 的交接阶段；Connector 负责把任务转换为 worker 可执行的 load 描述。
+
+`KVPoolConnector` 是 DeepInfer 中间抽象层，不负责具体 Store 传输。它将任务提交给 `KVPoolWorker`，由 worker 把任务放入后台 Get 线程的请求队列。后台线程从队列取出 `KVLoadTask`，执行具体后端的 `get`，将数据写入预先分配的 prefix block，并记录完成结果。vLLM 的对应实现中，worker 线程将完成的请求 ID 放入线程安全的完成集合；DeepInfer 采用等价的完成事件队列，事件至少包含 `request_id`、`load_id`、成功/失败状态、已完成 block 信息和错误信息。
 
 完成结果通过模型执行边界回到主流程，过程如下：
 
-1. Scheduler 为命中请求分配 prefix block 并提交 `KVLoadTask`；任务进入 KV Get worker 的任务队列，请求进入 `kv_loading`。
-2. KV Get worker 从任务队列取任务，执行 Mooncake Store `get`，将每个 block 写入对应的 GPU/HBM 地址；worker 只发布完成事件，不修改 `Request` 状态或 Scheduler 队列。
-3. worker 完成任务后，将 `request_id`、`load_id` 和结果写入线程安全的 completion 队列。完成事件表示 KV 数据已经写入目标 block，不表示请求已经完成 Prefill 或生成。
-4. `post_forward()` 或等价的 worker 输出阶段轮询 completion 队列，构造本轮的 KV connector 输出；输出中携带 `finished_recving`、失败请求和无效 block 等信息，并随 `ModelRunnerOutput` 返回主流程。
-5. Engine 主流程把该输出交给 Scheduler 的 completion 更新入口。Scheduler 在主线程校验 `request_id`、`load_id`、请求状态和 block 结果，丢弃重复、过期或已取消请求的无效事件。
-6. 校验成功时，Scheduler 标记 completion 已应用，更新已加载 prefix token/block 状态，从 `kv_loading` 移除请求并加入 `kv_ready`；请求在本次输出处理阶段不直接执行模型计算。
+1. Scheduler 为命中请求分配 prefix block，构造 `KVLoadTask` 并写入 `SchedulerOutputs.kv_load_tasks`，请求进入 `kv_loading`；Scheduler 不直接提交后台线程任务。
+2. `LLMEngine.step()` 在 `Scheduler.schedule()` 返回后进入 `post_schedule(scheduler_outputs)`；该扩展点调用 `KVPoolConnector.start_load_kv(kv_load_tasks)`，Connector 将任务转换后交给 `KVPoolWorker.submit_load_tasks()`，worker 再将任务放入后台 Get 线程队列。
+3. KV Get worker 从线程队列取任务，执行具体后端的 `get`，将每个 block 写入对应的 GPU/HBM 地址；worker 只发布完成事件，不修改 `Request` 状态或 Scheduler 队列。
+4. worker 完成任务后，将 `request_id`、`load_id` 和结果写入线程安全的 completion 队列。完成事件表示 KV 数据已经写入目标 block，不表示请求已经完成 Prefill 或生成。
+5. 下一次 `LLMEngine.step()` 开始时，调用 `KVPoolConnector.poll_completions()`；Connector 读取 completion 队列并返回完成结果，随后由 Engine 调用 Scheduler 的 completion 更新入口。这个轮询职责对应 vLLM 的 worker connector 在 `post_forward()` 中获取 transfer results，但 DeepInfer 将它放在下一轮 step 的主流程入口。
+6. Scheduler 在主线程校验 `request_id`、`load_id`、请求状态和 block 结果，丢弃重复、过期或已取消请求的无效事件。校验成功时标记 completion 已应用，更新已加载 prefix token/block 状态，从 `kv_loading` 移除请求并加入 `kv_ready`；请求在本次 completion 处理阶段不直接执行模型计算。
 7. 下一次 `Scheduler.schedule()` 优先扫描 `kv_ready`，计算 suffix block 数并尝试分配。分配成功后移出 `kv_ready`，加入本轮调度结果并执行 suffix Prefill；分配失败则保留请求和 prefix block，等待下一轮重试。
 
 ```mermaid
 sequenceDiagram
     participant S as Scheduler
-    participant Q as KV Get task queue
-    participant W as KV Get worker thread
+    participant O as SchedulerOutputs
+    participant E as LLMEngine.step
+    participant K as KVPoolConnector
+    participant W as KVPoolWorker
+    participant Q as KV Get thread queue
     participant C as completion queue
-    participant P as post_forward / worker output
-    participant E as Engine main flow
 
-    S->>Q: submit KVLoadTask(request_id, load_id, blocks)
+    S->>O: write kv_load_tasks
     S->>S: waiting -> kv_loading
+    O-->>E: return SchedulerOutputs
+    E->>K: post_schedule -> start_load_kv(kv_load_tasks)
+    K->>W: submit_load_tasks(tasks)
+    W->>Q: enqueue tasks
     W->>Q: dequeue task
     W->>W: Mooncake Store get
     W->>W: write data to target prefix blocks
     W->>C: publish completion(request_id, load_id, result)
-    P->>C: poll completed events
-    P-->>E: ModelRunnerOutput.KVConnectorOutput
-    E->>S: update KV transfer completion
+    E->>K: next step poll_completions()
+    K->>C: drain completions
+    K-->>E: completion results
+    E->>S: apply_kv_completions()
     S->>S: validate request_id/load_id/result
     S->>S: kv_loading -> kv_ready
     S->>S: next schedule: suffix allocation
-    S-->>E: schedule suffix Prefill
 ```
 
-因此，DeepInfer 的实现边界应保持为：后台线程负责传输和发布 completion，`LLMEngine.step()`/`post_forward()` 负责收集 completion，Scheduler 主线程负责状态和队列迁移。不能由 Get worker 线程直接把请求从 `kv_loading` 移到 `kv_ready`，也不能在线程中直接调用 Prefill。
+因此，DeepInfer 的实现边界应保持为：后台线程负责传输和发布 completion，`LLMEngine.step()` 开始阶段通过 `KVPoolConnector.poll_completions()` 收集 completion，Scheduler 主线程负责状态和队列迁移。不能由 Get worker 线程直接把请求从 `kv_loading` 移到 `kv_ready`，也不能在线程中直接调用 Prefill。
 
 ### 2.4 Get 额度与取消处理
 
@@ -191,10 +198,11 @@ LLMEngine.step()
 
 ```text
 LLMEngine.step()
-    → KVPoolWorker.poll_completions()
+    → KVPoolConnector.poll_completions()
     → Scheduler.schedule(sequence_metadata_pool)
-    → KVPoolWorker.submit_get_tasks(scheduler_outputs.kv_load_tasks)
     → post_schedule(scheduler_outputs)
+    → KVPoolConnector.start_load_kv(scheduler_outputs.kv_load_tasks)
+    → KVPoolWorker.submit_load_tasks()
     → execute_model_step()
 ```
 
@@ -289,9 +297,9 @@ class Scheduler:
 
 ```text
 class KVPoolWorker:
-    def submit_get_tasks(self, tasks):
+    def submit_load_tasks(self, tasks):
         for task in tasks:
-            self.executor.submit(self._get_one_task, task)
+            self.get_thread.request_queue.put(task)
 
     def _get_one_task(self, task):
         items = []
@@ -309,7 +317,7 @@ class KVPoolWorker:
         )
 
     def poll_completions(self):
-        # 由 LLMEngine.step() 发起；这里只读取完成队列，不修改 Scheduler 状态。
+        # 由 KVPoolConnector 调用；这里只读取完成队列，不修改 Scheduler 状态。
         return self.completion_queue.drain()
 ```
 
