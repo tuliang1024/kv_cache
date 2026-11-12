@@ -25,24 +25,79 @@ vLLM 的远端 KV 流程将“外部 block 分配、异步加载、完成确认�
 
 - 不重新定义 REQ-KVP-02 的 hash/key 规则。
 - 不替换 REQ-KVP-03 的 Store client。
-- 不在本次方案引入 SWA 远端加载或 chunk prefill 分支。
+- 不在本次方案引入 SWA 远端加载。
 
 ### 5. 设计方案
 
 ### 5.1 总体流程
 
-![异步 KV Get 流程](https://raw.githubusercontent.com/tuliang1024/kv_cache/main/REQ-KVP-04-async-kv-get/img/async-kv-get-flow.svg)
+本节只描述**异步 Get 任务的下发与完成回收**：Scheduler 内部如何选请求、如何算额度、失败后如何回退，都不在本节展开。
 
-流程顺序如下：
+单步时序（对应 vLLM 的 `schedule → execute_model → post_forward → update_from_output` 主线）：
 
-1. 上游在 `add_sequence()` 前完成前缀匹配，向 DeepInfer 传入命中 token 数。
-2. `Scheduler` 将请求放入 `waiting`，只保存命中结果，不提前占用 HBM。
-3. 调度接纳时校验命中结果并分配 prefix block，生成 `KVLoadTask`，请求转入 `kv_loading`。
-4. Python worker 依据请求 token、实际 block size、布局版本和 rank 拓扑生成 key，将每个 block 作为一个 Store item 提交到后台线程。
-5. Store 直接向已注册的 `gpu_blocks` HBM segment 写入数据。
-6. 下一轮 `LLMEngine.step()` 发起 completion poll，Scheduler 主线程校验 `load_id`、请求状态的结果。
-7. 成功请求进入优先处理的 `kv_ready` 队列；suffix block 分配成功后直接进入当前或下一轮 Prefill。
-8. 失败请求按本方案整体按 miss 重新 Prefill；后台 Store 未完成前不得释放目标 block。
+```mermaid
+sequenceDiagram
+    autonumber
+    participant E as LLMEngine.step
+    participant S as Scheduler（C++）
+    participant O as SchedulerOutputs
+    participant W0 as driver Worker（cp_rank 0）
+    participant WN as 其他 rank Worker
+    participant K as KVPoolConnector
+    participant P as KVPoolWorker（Get 线程）
+    participant ST as Mooncake Store
+    participant Q as completion queue
+    participant A as KVLoadManager（engine 侧）
+
+    Note over E,A: 阶段一：调度只产出计划，不做 I/O
+    E->>S: schedule(sequence_metadata_pool)
+    S->>S: 命中请求：分配并 pin prefix block，记 load_id
+    S->>O: kv_load_tasks（request_id / load_id / 目标 block / 命中长度）
+    S->>S: 请求转入 kv_loading，本步不参与计算
+    S-->>E: SchedulerOutputs（含 kv_load_tasks）
+
+    Note over E,WN: 阶段二：任务随本步下发到每个 rank
+    E->>W0: _execute_model_async_step → run_workers(execute_model_step, kv_load_tasks=...)
+    E->>WN: cp_broadcast_object((method, kwargs)) 广播同一份参数
+    Note over W0,WN: kv_load_tasks 走 kwargs 广播，不能放 driver_kwargs（只给 driver）
+
+    Note over W0,P: 阶段三：各 rank 在 forward 之后提交 get
+    W0->>W0: execute_main_model 下发 forward
+    WN->>WN: execute_main_model 下发 forward
+    W0->>K: start_load_kv(kv_load_tasks)
+    WN->>K: start_load_kv(kv_load_tasks)
+    K->>P: submit_load_task(本 rank 的任务)
+    P->>P: 入队后立即返回，不阻塞本步
+    P->>ST: store.get(keys, addrs)
+    ST-->>P: 直写本 rank HBM block，逐 block 返回码
+
+    Note over P,Q: 阶段四：完成后经队列回传，不走 execute_model_step 返回值
+    P->>Q: put KVLoadCompletion(request_id, load_id, rank, ok)
+    W0-->>E: execute_model_step 只返回模型输出
+    WN-->>E: 无返回（run_workers 单向广播）
+
+    Note over E,A: 阶段五：engine 聚合，再交给 Scheduler
+    E->>A: 下一次 step 开头 poll，且在 schedule 之前
+    A->>Q: get_nowait 逐 rank 非阻塞取
+    A->>A: 按 request_id + load_id 累计已 ack 的 rank，凑满 CP 组才判完成
+    A-->>E: ready / failed
+    E->>S: apply_kv_completions(ready)
+    S->>S: kv_loading 转 kv_ready
+    Note over S: 下一轮 schedule 分配 suffix block<br/>并进入 Prefill
+```
+
+特殊或新增位置说明：
+
+| #  | 位置                                      | 说明                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| -- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ① | `SchedulerOutputs.kv_load_tasks`        | 对应 vLLM 的 `SchedulerOutput.kv_connector_metadata`（`ReqMeta` 列表）。只描述任务，Scheduler 全程不碰 Store。                                                                                                                                                                                                                                                                                                                                  |
+| ② | `execute_model_step(kv_load_tasks=...)` | 必须作为 `_run_workers()` 的普通 `kwargs` 下发（`worker/base.py:300` 会广播），**不能放进 `driver_kwargs`**（`:302` 只给 driver）。`seq_metadata_list` / `scheduler_outputs` 是 pybind 对象不可序列化，所以才放 `driver_kwargs`。                                                                                                                                                                                             |
+| ③ | `start_load_kv()` 的调用点              | vLLM 在 worker 的 `post_forward()` 里提交（`vllm/v1/worker/gpu/kv_connector.py:142-143`）；DeepInfer 在**每个 rank** 的 `execute_model_step` 内、`execute_main_model` 下发之后调用（`deepinfer/worker/worker.py:121-127` 之后，`_post_process_step` 里的 `sample_end_evt.synchronize()` 之前）。不能只在 driver 调，否则其他 rank 不会提交自己的分片。                                                                          |
+| ④ | 完成回传通道                              | 不走 `execute_model_step` / `run_workers()` 的返回值。每 rank 一条 completion 队列：rank0 是 engine 进程内的 `queue.Queue`，其余 rank 是 engine 创建、spawn 时随 `args` 传入的 `mp.Queue`（`llm_engine.py:377-395`）。IO 线程直接 `put`，因此不需要 vLLM 的 `get_transfer_results()` + `ModelRunnerOutput.kv_connector_output` 那条回传链；若要对齐 vLLM 的写法，可在步末加一次 `get_finished()` 收口后再 `put`，但只报一次。 |
+| ⑤ | engine 侧聚合                             | `KVLoadManager.poll()` 取代 vLLM 的 `KVOutputAggregator`：key 为 `(request_id, load_id)`，期望集合是 CP 组（DeepInfer 无 TP/PP，DP 是独立引擎，各有一份调度器）。                                                                                                                                                                                                                                                                             |
+| ⑥ | poll 时机                                 | 在 `Scheduler.schedule()` **之前**（`llm_engine.py:885` 之前）。vLLM 的完成态在 `update_from_output()` 落地、下一轮 `schedule()` 才 promote；这里提前一个半拍，完成消息到达后同一步即可进入 suffix 调度。                                                                                                                                                                                                                             |
+| ⑦ | 每 rank 必须上报                          | 即使某 rank 的分片为空也要上报成功，否则计数永远凑不满 CP 组（与 vLLM `nixl/pull_worker.py:208` 同一约束）。                                                                                                                                                                                                                                                                                                                                      |
+| ⑧ | 纯等待步                                  | 本步无其他请求时 `scheduler_outputs` 为空，`execute_model_step` 会走 `is_placeholder` 的 dummy forward（`worker.py:126-127`）。`start_load_kv` 必须在这个分支里也调用，否则 waiting 期的 Get 永远发不出去。                                                                                                                                                                                                                               |
 
 ### 5.2 队列
 
@@ -98,56 +153,9 @@ flowchart TD
     Z --> A
 ```
 
-### 5.3 异步 Get 完成与 Scheduler 消费
+### 5.3 Get 额度与取消处理
 
-Scheduler 不直接调用 Mooncake，也不直接把任务放入后台线程队列。Scheduler 只将待加载任务作为本地 `SchedulerOutputs` 的元数据输出，例如 `kv_load_tasks`。DeepInfer 在 `LLMEngine.step()` 中、`Scheduler.schedule()` 返回之后且进入 `_execute_model_async_step()` 之前，通过现有的 `post_schedule(scheduler_outputs)` 扩展点调用新增的 `KVPoolConnector.start_load_kv(scheduler_outputs.kv_load_tasks)`。这个位置对应 vLLM 将 `SchedulerOutput` 交给 Worker/Connector 的交接阶段；Connector 负责把任务转换为 worker 可执行的 load 描述。
-
-`KVPoolConnector` 是 DeepInfer 中间抽象层，不负责具体 Store 传输。它将任务提交给 `KVPoolWorker`，由 worker 把任务放入后台 Get 线程的请求队列。后台线程从队列取出 `KVLoadTask`，执行具体后端的 `get`，将数据写入预先分配的 prefix block，并记录完成结果。vLLM 的对应实现中，worker 线程将完成的请求 ID 放入线程安全的完成集合；DeepInfer 采用等价的完成事件队列，事件至少包含 `request_id`、`load_id`、成功/失败状态、已完成 block 信息和错误信息。
-
-完成结果通过模型执行边界回到主流程，过程如下：
-
-1. Scheduler 为命中请求分配 prefix block，构造 `KVLoadTask` 并写入 `SchedulerOutputs.kv_load_tasks`，请求进入 `kv_loading`；Scheduler 不直接提交后台线程任务。
-2. `LLMEngine.step()` 在 `Scheduler.schedule()` 返回后进入 `post_schedule(scheduler_outputs)`；该扩展点调用 `KVPoolConnector.start_load_kv(kv_load_tasks)`，Connector 将任务转换后交给 `KVPoolWorker.submit_load_tasks()`，worker 再将任务放入后台 Get 线程队列。
-3. KV Get worker 从线程队列取任务，执行具体后端的 `get`，将每个 block 写入对应的 GPU/HBM 地址；worker 只发布完成事件，不修改 `Request` 状态或 Scheduler 队列。
-4. worker 完成任务后，将 `request_id`、`load_id` 和结果写入线程安全的 completion 队列。完成事件表示 KV 数据已经写入目标 block，不表示请求已经完成 Prefill 或生成。
-5. 下一次 `LLMEngine.step()` 开始时，调用 `KVPoolConnector.poll_completions()`；Connector 读取 completion 队列并返回完成结果，随后由 Engine 调用 Scheduler 的 completion 更新入口。这个轮询职责对应 vLLM 的 worker connector 在 `post_forward()` 中获取 transfer results，但 DeepInfer 将它放在下一轮 step 的主流程入口。
-6. Scheduler 在主线程校验 `request_id`、`load_id`、请求状态和 block 结果，丢弃重复、过期或已取消请求的无效事件。校验成功时标记 completion 已应用，更新已加载 prefix token/block 状态，从 `kv_loading` 移除请求并加入 `kv_ready`；请求在本次 completion 处理阶段不直接执行模型计算。
-7. 下一次 `Scheduler.schedule()` 优先扫描 `kv_ready`，计算 suffix block 数并尝试分配。分配成功后移出 `kv_ready`，加入本轮调度结果并执行 suffix Prefill；分配失败则保留请求和 prefix block，等待下一轮重试。
-
-```mermaid
-sequenceDiagram
-    participant S as Scheduler
-    participant O as SchedulerOutputs
-    participant E as LLMEngine.step
-    participant K as KVPoolConnector
-    participant W as KVPoolWorker
-    participant Q as KV Get thread queue
-    participant C as completion queue
-
-    S->>O: write kv_load_tasks
-    S->>S: waiting -> kv_loading
-    O-->>E: return SchedulerOutputs
-    E->>K: post_schedule -> start_load_kv(kv_load_tasks)
-    K->>W: submit_load_tasks(tasks)
-    W->>Q: enqueue tasks
-    W->>Q: dequeue task
-    W->>W: Mooncake Store get
-    W->>W: write data to target prefix blocks
-    W->>C: publish completion(request_id, load_id, result)
-    E->>K: next step poll_completions()
-    K->>C: drain completions
-    K-->>E: completion results
-    E->>S: apply_kv_completions()
-    S->>S: validate request_id/load_id/result
-    S->>S: kv_loading -> kv_ready
-    S->>S: next schedule: suffix allocation
-```
-
-因此，DeepInfer 的实现边界应保持为：后台线程负责传输和发布 completion，`LLMEngine.step()` 开始阶段通过 `KVPoolConnector.poll_completions()` 收集 completion，Scheduler 主线程负责状态和队列迁移。不能由 Get worker 线程直接把请求从 `kv_loading` 移到 `kv_ready`，也不能在线程中直接调用 Prefill。
-
-### 5.4 Get 额度与取消处理
-
-#### 5.4.1 Get 额度
+#### 5.3.1 Get 额度
 
 Scheduler 使用 `max_num_inflight_kv_loads` 限制同时占用的异步 Get 额度。新请求只有在下面的数量之和小于该上限时，才可以分配 prefix block 并提交异步 Get：
 
@@ -160,7 +168,7 @@ Scheduler 使用 `max_num_inflight_kv_loads` 限制同时占用的异步 Get 额
 
 其中，`aborted_kv_loads` 只记录已经取消、但底层 Get 尚未确认结束的请求或任务 ID。它们仍占用 Get 额度，直到 completion 到达或底层任务明确结束后才从集合移除并释放目标 block。
 
-#### 5.4.2 取消和资源释放
+#### 5.3.2 取消和资源释放
 
 取消请求时，Scheduler 主线程先从 `waiting`、`kv_loading` 和 `kv_ready` 中移除请求，再标记 `FINISHED_ABORTED`：
 
@@ -181,13 +189,13 @@ flowchart TD
 
 `kv_ready` 中的请求已经完成 Get，因此可以立即释放已加载的 prefix block；`kv_loading` 中的请求可能仍有后台线程向目标 block 写入，必须延迟释放，避免后台传输访问已被复用的 block。
 
-### 5.5 失败、取消和资源不足
+### 5.4 失败、取消和资源不足
 
 - **部分 block 失败**：按本方案将本次异步加载整体视为失败，释放本次 Get 分配的全部 prefix block，清零命中状态，放回 `waiting` 队头并重新申请全量 block 执行 Prefill。
 - **只有请求级结果**：无法判断逐 block 结果时，同样按整体 miss 处理。
 - **Store 连接异常**：由 Mooncake backend 的重连、重注册和熔断逻辑处理；Scheduler 只接收失败结果，不等待重连。
 
-### 5.6 与现有 DeepInfer 入口的接入
+### 5.5 与现有 DeepInfer 入口的接入
 
 当前入口为：
 
@@ -211,15 +219,15 @@ LLMEngine.step()
     → execute_model_step()
 ```
 
-### 5.7 实现边界
+### 5.6 实现边界
 
-#### 5.7.1 C++ Scheduler 与 Python worker
+#### 5.6.1 C++ Scheduler 与 Python worker
 
 - C++ Scheduler 负责命中 block 的资源接纳、队列状态、`load_id`、完成事件和 block 生命周期。
 - Python worker 负责生成 Store key、构造已注册 HBM segment、后台调用 Mooncake `get` 和投递完成事件。
 - worker 不直接修改 `Sequence`、`block_table` 或 Scheduler 队列；所有状态变化在主调度线程应用。
 
-#### 5.7.2 队列优先级
+#### 5.6.2 队列优先级
 
 调度优先级为 `kv_ready`、普通 `waiting`；`kv_loading` 不参与模型调度。`kv_ready` 等价于 vLLM 的 KV holding waiting，资源不足时保持队首，不追加到普通 waiting 队尾。
 
@@ -553,8 +561,10 @@ _No response_
 ### 11. 遗留问题
 
 ### 待确认的遗留问题
+
 - 问题：
 
 ### 确认暂不解决的问题
+
 - 问题：
   暂不解决的原因：
