@@ -352,30 +352,39 @@ deepinfer/kv_cache/pool/worker.py     : KVPoolWorker（单实例，Connector 持
 
 ### 6.1 数据对象与 SchedulerOutputs 扩展
 
-```text
-struct KVLoadTask:                      # driver worker → 后台 Get 线程
-    request_id
-    load_id                             # Scheduler 为每次 load 分配的单调 ID
-    request_token_ids                   # 供 REQ-KVP-02 生成 block key
-    prefix_hit_tokens                   # 命中长度（block 对齐）
-    local_block_ids                     # Scheduler 已分配并 pin 的目标 block
-    block_size
-    block_bytes
-    layout_version
-    tenant
+```python
+from dataclasses import dataclass
 
-struct KVLoadCompletion:                # 后台 Get 线程 → engine
-    request_id
-    load_id
+
+@dataclass(frozen=True)
+class KVLoadTask:
+    """driver worker → 后台 Get 线程；只描述任务，不做 I/O。"""
+
+    request_id: str
+    load_id: int                        # Scheduler 为每次 load 分配的单调 ID
+    request_token_ids: tuple[int, ...]  # 供 REQ-KVP-02 生成 block key
+    prefix_hit_tokens: int              # 命中长度（block 对齐）
+    local_block_ids: tuple[int, ...]    # Scheduler 已分配并 pin 的目标 block
+    block_size: int
+    block_bytes: int
+    layout_version: str
+    tenant: str
+
+
+@dataclass(frozen=True)
+class KVLoadCompletion:
+    """后台 Get 线程 → engine。"""
+
+    request_id: str
+    load_id: int
     block_results: list[bool]           # 与 local_block_ids 等长
-    error: Error | None
+    error: BaseException | None = None
+```
 
-struct SchedulerOutputs:
-    # 现有字段不变
-    scheduled_seqs, finished_seqs, prompt_run, ...
+`SchedulerOutputs` 是 C++ pybind 类型（`csrc/engine/outputs.hpp`），不能改成 dataclass；新增字段按现有方式暴露：
 
-    # 新增：只描述待提交任务，不做 I/O
-    kv_load_tasks: list[KVLoadTask]
+```python
+# scheduler_outputs.kv_load_tasks: list[KVLoadTask]   # 本步新接纳的 load，不做 I/O
 ```
 
 本方案只考虑单 driver worker：`kv_load_tasks` 直接由 `SchedulerOutputs` 交给 driver，不存在按 rank 拆分或跨进程下发的问题。
