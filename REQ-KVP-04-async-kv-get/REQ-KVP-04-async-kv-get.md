@@ -76,8 +76,8 @@ sequenceDiagram
     P->>F: put KVLoadCompletion(request_id, load_id, rank, ok)
 
     Note over W0,K: 阶段五：本步提交后立刻收口（对齐 vLLM post_forward）
-    W0->>K: get_finished(active_req_ids)
-    WN->>K: get_finished(active_req_ids)
+    W0->>K: get_finished()
+    WN->>K: get_finished()
     K->>P: drain finished queue
     P-->>K: 截至此刻已完成的 completion 列表
     K-->>W0: completions
@@ -229,7 +229,7 @@ kv_ready      Store Get 已完成，等待应用 completion 和 suffix block 分
 1. 优先扫描 `kv_ready`：查看队首请求，先检查 completion 是否为完整成功；只有完整成功时才计算 suffix block 数并尝试分配。completion 已在请求进入 `kv_ready` 前由 Scheduler 主线程校验并应用。
 2. 按本方案的失败策略，如果 completion 只有部分 block 成功，或请求级 Get 失败，则将本次异步加载视为整体无效：释放本次异步 Get 分配的全部 prefix block，清零 prefix 命中和已加载 token 状态，从 `kv_ready` 移除并使用 `push_front` 放回 `waiting` 队头；下一次调度按无 prefix 命中的普通路径重新申请全量 block 并执行完整 Prefill，不继续使用部分 prefix。vLLM 对逐 block `invalid_block_ids` 另有保留连续有效前缀的处理；本方案选择全量重算以简化 DeepInfer 的失败恢复路径。
 3. completion 完整成功且 suffix block 分配成功时，从 `kv_ready` 移除请求，加入本轮调度结果并执行 suffix Prefill，该请求的本轮处理结束。
-4. completion 完整成功但 suffix block 分配失败时，不移除请求，不释放已应用的 prefix block；本轮跳过或结束 `kv_ready` 扫描，下一轮只重试 suffix block 分配。
+4. completion 完整成功但 suffix block 分配失败时，不移除请求，不释放已应用的 prefix block；本轮结束 `kv_ready` 扫描，请求的 `suffix_retry_count += 1`，下一轮只重试 suffix block 分配。当 `suffix_retry_count > suffix_retry_max`（上游池化配置，随 `PrefixMatch` 下发，见 REQ-KVP-05 §7.2）时按失败处理：释放本次异步 Get 分配的**全部 prefix block**、清零 prefix 命中与已加载 token 状态（`cached_hit_tokens=0`），从 `kv_ready` 移除并 `push_front` 放回 `waiting` 队头，下一轮按无前缀命中执行完整 Prefill。`suffix_retry_count` 在请求进入 `kv_ready` 时清零，回退时随命中状态一并清零。
 5. `kv_ready` 当前为空或本轮资源不允许继续处理时，处理 `waiting`：没有 prefix 命中则按现有路径执行普通 Prefill；有 prefix 命中则检查 inflight Get 额度，额度足够时分配 prefix block、生成并提交 Get task，再将请求移入 `kv_loading`；额度不足时保留在 `waiting`，不分配 prefix block，也不提交 Get。
 6. `kv_loading` 中的请求不参与模型计算。Get 完成后由 Scheduler 主线程应用完成事件并转入 `kv_ready`，不得在 worker 线程直接操作 Scheduler 队列。
 
@@ -245,8 +245,9 @@ flowchart TD
     D -->|是| G[计算 suffix block 数]
     G --> H{suffix block 分配成功?}
     H -->|是| I[从 kv_ready 移除\n加入本轮调度结果\n执行 suffix Prefill\n本轮处理结束]
-    H -->|否| J[保留在 kv_ready\n不释放 prefix block\n本轮跳过或结束该队列扫描]
-    J --> K[下一轮重试 suffix block]
+    H -->|否，suffix_retry_count += 1| J{suffix_retry_count > suffix_retry_max?}
+    J -->|否| K[保留在 kv_ready\n不释放 prefix block\n本轮结束该队列扫描\n下一轮重试 suffix]
+    J -->|是| E
 
     B -->|否| L[从 waiting 取请求]
     L --> M{prefix 命中?}
@@ -366,6 +367,7 @@ LLMEngine.step()
 LLMEngine.step()
     → KVLoadManager.poll()                                    # ① 主线程聚合各 rank 的 completion
     → Scheduler.schedule(sequence_metadata_pool)              # ② 产出 kv_load_tasks
+    → KVLoadManager.register(kv_load_tasks)                   # ②-1 先登记期望，再下发
     → post_schedule(scheduler_outputs)                        # ③ 原有扩展点，不在此下发 Get
     → _execute_model_async_step(..., kv_load_tasks=...)       # ④ 随 step 广播到每个 rank
         → 每个 rank：Worker.execute_model_step(kv_load_tasks=...)
@@ -373,7 +375,7 @@ LLMEngine.step()
             → KVPoolConnector.start_load_kv(kv_load_tasks)    # ⑤-2 每 rank 提交本 rank 分片
                 → KVPoolWorker.submit_load_task()
                 → Get 线程队列 → store.get → 直写本 rank HBM
-            → KVPoolConnector.get_finished(active_req_ids)    # ⑤-3 步内收口
+            → KVPoolConnector.get_finished()    # ⑤-3 步内收口
                 → KVPoolWorker.get_finished()（drain finish 队列）
                 → Worker 把结果写入本 rank 自己的 completion queue
             → sample / post_process（与已提交的 Get 并行）      # ⑤-4
@@ -412,9 +414,9 @@ LLMEngine.step()
 ### 目录结构
 
 ```text
-deepinfer/kv_cache/pool/connector.py  : KVPoolConnector（每 rank）：start_load_kv（任务转换与提交）、get_finished（步内 drain worker 的 finish 队列并写入本 rank completion queue）、cancel_request（取消清理）
+deepinfer/kv_cache/pool/connector.py  : KVPoolConnector（每 rank）：start_load_kv（任务转换与提交）、get_finished（步内 drain worker 的 finish 队列并返回给 Worker）、cancel_request（取消清理）
 deepinfer/kv_cache/pool/worker.py     : KVPoolWorker（每 rank，Connector 持有）：本地 request queue + 后台 Get 线程，复用 REQ-KVP-02 key 生成与 REQ-KVP-03 MooncakeStoreClient.get() 直写 HBM，完成写入自己的 finish 队列；不感知 engine 侧对象
-deepinfer/kv_cache/pool/manager.py    : KVLoadManager（engine 侧唯一）：持有 rank → completion queue 映射，poll() 逐 rank 聚合，凑满 CP 组后交给 Scheduler
+deepinfer/kv_cache/pool/manager.py    : KVLoadManager（engine 侧唯一）：register/poll/discard；持有 rank → completion queue 映射，逐 rank 聚合，凑满期望 rank 后交给 Scheduler
 ```
 
 `KVPoolWorker` 只做传输并把完成写进自己的 finish 队列；`KVPoolConnector` 只做适配，步内 drain 后把结果返回给 `Worker`；**各 rank 的 `Worker` 各写自己的 completion queue**；`KVLoadManager` 只在 engine 侧聚合；状态迁移全部由下一轮 `LLMEngine.step()` 在主线程应用。
@@ -424,110 +426,102 @@ deepinfer/kv_cache/pool/manager.py    : KVLoadManager（engine 侧唯一）：�
 ### 6.1 数据对象与 SchedulerOutputs 扩展
 
 ```text
-struct KVLoadTask:
+struct KVLoadTask:                      # 一份广播，各 rank 内容相同
     request_id
-    load_id                         # Scheduler 为每次 load 分配的单调 ID
-    request_token_ids               # 用于 connector 生成 block key
-    prefix_hit_tokens
-    local_block_ids                 # Scheduler 已分配并 pin 的目标 block
+    load_id                             # Scheduler 为每次 load 分配的单调 ID
+    request_token_ids                   # 供 REQ-KVP-02 生成 block key
+    prefix_hit_tokens                   # 命中长度（block 对齐）
+    local_block_ids                     # Scheduler 已分配并 pin 的目标 block（各 rank 共用同一批 id）
     block_size
     block_bytes
     layout_version
     tenant
 
-struct KVLoadCompletion:
+struct KVLoadCompletion:                # rank → engine
     request_id
     load_id
-    block_results: list[bool]       # 与 local_block_ids 等长；短读/异常为 False
+    rank                                # cp_rank，用于诊断与去重
+    block_results: list[bool]           # 与 local_block_ids 等长；空分片为 []
     error: Error | None
 
 struct SchedulerOutputs:
-    # DeepInfer 现有字段保持不变
-    scheduled_seqs
-    finished_seqs
-    prompt_run
-    ...
+    # 现有字段不变
+    scheduled_seqs, finished_seqs, prompt_run, ...
 
-    # 本需求新增：只描述待提交任务，不执行 I/O
+    # 新增：只描述待提交任务，不做 I/O
     kv_load_tasks: list[KVLoadTask]
 ```
 
-### 6.2 Scheduler：完成事件、异步接纳和正常调度
+block id 在各 rank 上是同一套编号，各 rank 用它索引自己的 HBM，因此任务是"一份广播"，不按 rank 拆分；空分片 rank 也必须上报 `block_results=[]`。
+
+### 6.2 Scheduler：完成事件、异步接纳与 kv_ready 调度
+
+以下为新增逻辑，落在 `csrc/engine/scheduler.hpp`（`waiting`、`block_manager` 均为现有成员）。
 
 ```text
 class Scheduler:
+    # ── ① 应用 completion（由 LLMEngine.step() 在 schedule() 之前调用）──
     def apply_kv_completions(self, completions):
-        # 由 LLMEngine.step() 主线程调用；不调用 KVPoolWorker。
-        for completion in completions:
-            seq = self.requests.get(completion.request_id)
+        for c in completions:
+            seq = self.requests.get(c.request_id)
             if seq is None:
-                continue                         # 请求已清理
-
-            if seq.kv_load_id != completion.load_id:
-                continue                         # 旧事件、重复事件或 load_id 不匹配
-
+                continue                        # 请求已清理
+            if seq.kv_load_id != c.load_id:
+                continue                        # 旧事件 / 重复事件
             if seq.status == FINISHED_ABORTED:
-                self.release_loaded_prefix_blocks_once(seq)
                 self.kv_loading.remove_if_present(seq)
-                self.aborted_kv_loads.discard(completion.request_id)
+                self.release_loaded_prefix_blocks_once(seq)
+                self.aborted_kv_loads.discard(c.request_id)
                 continue
-
-            # completion 到达后才允许释放/复用 kv_loading 的目标 block。
-            seq.pending_completion = completion
+            seq.pending_completion = c
             self.kv_loading.remove(seq)
-            self.kv_ready.push_back(seq)
+            self.kv_ready.push_back(seq)        # completion 到齐后才允许释放目标 block
 
+    # ── ② 接纳：只从 waiting 队首推进，保证 FIFO ──
     def _admit_waiting_kv_loads(self, outputs):
-        # 只接纳尚未启动异步 Get 的 waiting 请求；无 prefix 命中的请求
-        # 留给 DeepInfer 原有的普通 Prefill 调度，不在这里出队。
-        for seq in list(self.waiting):
+        while self.waiting:
+            seq = self.waiting.peek_front()
             hit_tokens = seq.prefix_hit_tokens_from_upstream
             if hit_tokens == 0:
-                continue
-
+                break                           # 无命中，交给原有 Prefill 调度
             if hit_tokens % self.block_size != 0:
-                # 非 block 对齐命中不能提交异步 block Get，按普通 miss 处理。
                 seq.prefix_hit_tokens_from_upstream = 0
-                continue
-
+                break                           # 非 block 对齐按 miss 处理
             block_count = hit_tokens // self.block_size
             if not self._admits_inflight_kv_load():
-                break                            # 当前及后续请求留在 waiting
+                break                           # 额度不足：留在队首
             if not self.block_manager.can_allocate(block_count):
-                break                            # 保留 waiting 队头，等待资源
+                break                           # 块不足：留在队首
 
-            seq = self.waiting.pop_front()
+            self.waiting.pop_front()
             block_ids = self.block_manager.allocate(block_count)
-            self.pin(block_ids)
+            self.pin(block_ids)                 # 加载期禁止复用
 
             seq.kv_load_id = self.next_load_id()
             seq.prefix_hit_tokens = hit_tokens
-            seq.cache.num_tokens = hit_tokens
-            seq.status = WAITING_FOR_REMOTE_KVS
+            seq.cache.num_tokens = hit_tokens   # 后续只算 suffix
+            seq.status = WAITING_FOR_REMOTE_KVS # 新增 SequenceStatus
             self.kv_loading.push_back(seq)
 
             outputs.kv_load_tasks.append(
-                KVLoadTask(
-                    request_id=seq.request_id,
-                    load_id=seq.kv_load_id,
-                    request_token_ids=seq.prompt_token_ids,
-                    prefix_hit_tokens=hit_tokens,
-                    local_block_ids=block_ids,
-                    block_size=self.block_size,
-                    block_bytes=self.block_bytes,
-                    layout_version=self.layout_version,
-                    tenant=self.block_tenant,
-                )
+                KVLoadTask(request_id=seq.request_id, load_id=seq.kv_load_id,
+                           request_token_ids=seq.prompt_token_ids,
+                           prefix_hit_tokens=hit_tokens,
+                           local_block_ids=block_ids, block_size=self.block_size,
+                           block_bytes=self.block_bytes,
+                           layout_version=self.layout_version,
+                           tenant=self.block_tenant)
             )
 
+    # ── ③ kv_ready：suffix 分配成功后交回既有 Prefill 路径 ──
     def _schedule_kv_ready(self, outputs):
         while self.kv_ready:
             seq = self.kv_ready.front()
-            completion = seq.pending_completion
-            assert completion is not None
+            c = seq.pending_completion
+            assert c is not None
 
-            if not all(completion.block_results):
-                # 本方案的失败策略：部分成功也整体回退，不使用部分 prefix。
+            if c.error is not None or not all(c.block_results):
+                # 本方案失败策略：整体回退，不使用部分 prefix
                 self.kv_ready.pop_front()
                 self.release_loaded_prefix_blocks_once(seq)
                 seq.pending_completion = None
@@ -535,45 +529,39 @@ class Scheduler:
                 seq.prefix_hit_tokens = 0
                 seq.prefix_hit_tokens_from_upstream = 0
                 seq.status = WAITING
-                self.waiting.push_front(seq)  # 队头，下一轮优先全量 Prefill
+                self.waiting.push_front(seq)    # 队头，下一轮全量 Prefill
                 continue
 
             suffix_blocks = self.required_suffix_blocks(seq)
             if not self.block_manager.can_allocate(suffix_blocks):
-                break                            # 保留 kv_ready 队头及 prefix block
+                break                           # 保留 kv_ready 队首与 prefix block，下一轮重试
 
-            suffix_ids = self.block_manager.allocate(suffix_blocks)
-            seq.cache.block_table.append(suffix_ids)
+            seq.cache.block_table.append(self.block_manager.allocate(suffix_blocks))
             seq.pending_completion = None
+            seq.prefix_hit_tokens_from_upstream = 0
+            seq.status = WAITING
             self.kv_ready.pop_front()
-            self._append_prefill_result(outputs, seq, suffix_ids)
+            self.waiting.push_front(seq)        # 交回 _schedule_prefill：block_table 非空 → 跳过分配，只算 suffix
 
     def schedule(self, sequence_metadata_pool):
         outputs = SchedulerOutputsBuilder()
-        self._schedule_kv_ready(outputs)
-        self._admit_waiting_kv_loads(outputs)
-
-        # 复用 DeepInfer 现有 waiting/running 调度和 SequenceMetadata 构造。
-        outputs.extend(
-            self._schedule_normal_prefill_or_decode(sequence_metadata_pool)
-        )
+        self._schedule_kv_ready(outputs)        # 先 kv_ready
+        self._admit_waiting_kv_loads(outputs)   # 再 waiting 接纳
+        outputs.extend(self._schedule_normal_prefill_or_decode(sequence_metadata_pool))
         return outputs
 
+    # ── ④ 取消 ──
     def abort(self, request_id):
         seq = self.requests.get(request_id)
         if seq is None:
             return
-
         self.waiting.remove_if_present(seq)
         self.kv_ready.remove_if_present(seq)
-
         if seq in self.kv_loading:
             self.kv_loading.remove(seq)
             seq.status = FINISHED_ABORTED
             self.aborted_kv_loads.add(request_id)
-            # 后台 Get 可能仍在写入，延迟释放目标 prefix block。
-            return
-
+            return                              # 后台 Get 可能仍在写，延迟释放
         seq.status = FINISHED_ABORTED
         self.release_all_blocks(seq)
 ```
@@ -583,45 +571,118 @@ class Scheduler:
 ```text
 class LLMEngine:
     def step(self):
-        # 1. 主线程先聚合、再应用上一轮已完成的异步 Get（必须在 schedule 之前）。
-        ready = self.kv_load_manager.poll()
-        self.scheduler.apply_kv_completions(ready)
+        # 0. 保活前提：kv_loading 必须计入 has_unfinished_requests()，
+        #    否则最后一个请求转入加载后引擎会退出，completion 没人 poll。
+
+        # 1. 主线程聚合并应用上一轮完成（必须在 schedule 之前）。
+        completions = self.kv_load_manager.poll()
+        if completions:
+            self.scheduler.apply_kv_completions(completions)
 
         # 2. C++ Scheduler 生成本轮 metadata 和 kv_load_tasks。
         seq_metadata_list, scheduler_outputs = self.scheduler.schedule(
             self.sequence_metadata_pool
         )
 
-        # 3. post_schedule 不再承担 KV 下发，只保留原有逻辑。
+        # 3. 先登记期望，再下发，避免极快的 completion 在登记前到达被丢弃。
+        tasks = scheduler_outputs.kv_load_tasks
+        if tasks:
+            self.kv_load_manager.register(tasks)
+
+        # 4. post_schedule 不再承担 KV 下发，只保留原有逻辑。
         self.post_schedule(scheduler_outputs)
 
-        # 4. 任务随 execute_model_step 广播到每个 rank；
-        #    各 rank 在 forward 之后自行 start_load_kv / get_finished。
+        # 5. 任务随 execute_model_step 广播到每个 rank；
+        #    各 rank 在 forward 之后执行 start_load_kv / get_finished。
         request_outputs = self._execute_model_async_step(
-            seq_metadata_list,
-            scheduler_outputs,
-            kv_load_tasks=scheduler_outputs.kv_load_tasks,
+            seq_metadata_list, scheduler_outputs, kv_load_tasks=tasks
         )
         return request_outputs
+
+    def abort_request(self, request_id):
+        self.kv_load_manager.discard(request_id)   # 丢弃聚合中的期望，避免残留
+        ...                                        # 原有 abort 逻辑
 ```
 
-### 6.4 KVPoolConnector：调度元数据和 Worker 的适配层
+### 6.4 KVLoadManager：engine 侧聚合器
 
 ```text
-class KVPoolConnector:
+class KVLoadManager:                    # engine 进程内唯一实例
+    def __init__(self, queues, scheduler, expected_ranks):
+        self.queues = queues            # rank -> queue（rank0 queue.Queue，其余 mp.Queue）
+        self.scheduler = scheduler
+        self.expected_ranks = set(expected_ranks)   # 默认 CP 组
+        self.pending = {}               # (req_id, load_id) -> 已 ack 的 rank 集合
+        self.agg = {}                   # (req_id, load_id) -> 聚合中的 KVLoadCompletion
+
+    def register(self, tasks):
+        # 每步 schedule() 之后调用；只登记本步新接纳的 load
+        for task in tasks:
+            key = (task.request_id, task.load_id)
+            self.pending[key] = set()
+            self.agg[key] = KVLoadCompletion(
+                request_id=task.request_id,
+                load_id=task.load_id,
+                rank=-1,                                # 聚合结果不归属单个 rank
+                block_results=[True] * len(task.local_block_ids),
+                error=None,
+            )
+
+    def poll(self):
+        # 每步 schedule() 之前调用；返回"全部期望 rank 到齐"的聚合结果
+        ready = []
+        for rank, q in self.queues.items():
+            while True:
+                try:
+                    c = q.get_nowait()
+                except Empty:
+                    break
+                key = (c.request_id, c.load_id)
+                acked = self.pending.get(key)
+                if acked is None:
+                    continue                    # 未知 / 已聚合 / 已取消
+                acked.add(rank)
+                acc = self.agg[key]
+                if c.error is not None:
+                    acc.error = c.error
+                if c.block_results:
+                    acc.block_results = [
+                        a and b for a, b in zip(acc.block_results, c.block_results)
+                    ]
+                if acked >= self.expected_ranks:
+                    ready.append(self.agg.pop(key))
+                    self.pending.pop(key, None)
+        return ready
+
+    def discard(self, request_id):
+        for key in [k for k in self.pending if k[0] == request_id]:
+            self.pending.pop(key, None)
+            self.agg.pop(key, None)
+```
+
+### 6.5 KVPoolConnector：调度元数据与 Worker 的适配层
+
+```text
+class KVPoolConnector:                  # 每 rank 一份，由该 rank 的 Worker 持有
     def __init__(self, worker):
-        self.worker = worker                # 不持有跨进程队列
+        self.worker = worker
+        self._inflight = set()          # (request_id, load_id)
 
     def start_load_kv(self, tasks):
-        # 不调用 Store get；只把 Scheduler 任务转换为 worker 任务并入队。
+        # 不调用 Store get；只做任务转换与入队（每 rank 执行一次，处理同一份任务）
         for task in tasks:
+            self._inflight.add((task.request_id, task.load_id))
             self.worker.submit_load_task(self._build_worker_task(task))
 
-    def get_finished(self, active_req_ids):
-        # 步内收口：只 drain 本 rank worker 的 finish 队列并返回；
-        # 由调用方（Worker）负责写本 rank 的 completion queue。
-        # 不修改 Request / Scheduler 状态。
-        return self.worker.get_finished(active_req_ids)
+    def get_finished(self):
+        # 步内收口：drain 本 rank worker 的 finish 队列并返回；
+        # 由 Worker 负责写本 rank 的 completion queue。
+        out = []
+        for c in self.worker.get_finished():
+            if (c.request_id, c.load_id) in self._inflight:
+                self._inflight.discard((c.request_id, c.load_id))
+                out.append(c)
+        return out
 
     def _build_worker_task(self, task):
         return KVPoolWorkerTask(
@@ -636,13 +697,13 @@ class KVPoolConnector:
         )
 ```
 
-### 6.5 KVPoolWorker：后台队列和 Store Get
+### 6.6 KVPoolWorker：后台队列和 Store Get
 
 ```text
 class KVPoolWorker:
-    def __init__(self, store_client, gpu_blocks, rank_info):
+    def __init__(self, store_client, gpu_cache, rank_info):
         self.store_client = store_client       # REQ-KVP-03
-        self.gpu_blocks = gpu_blocks           # 已由 REQ-KVP-01 注册
+        self.gpu_cache = gpu_cache             # REQ-KVP-01 已注册的 HBM 视图
         self.rank_info = rank_info
         self.request_queue = Queue()
         self.finished_queue = Queue()          # 线程内完成集合，不感知 engine
@@ -659,22 +720,22 @@ class KVPoolWorker:
             finally:
                 self.request_queue.task_done()
 
-    def get_finished(self, active_req_ids):
-        # 只 drain 自己的 finish 队列；按 active_req_ids 过滤已结束/已取消的请求。
+    def get_finished(self):
         done = []
         while True:
             try:
-                completion = self.finished_queue.get_nowait()
+                done.append(self.finished_queue.get_nowait())
             except Empty:
                 break
-            if completion.request_id in active_req_ids:
-                done.append(completion)
         return done
 
     def _execute_get(self, task):
+        # 地址必须按 DeepInfer 的 KV 布局切分（main / SWA / compressed / state，
+        # 128-token grain），不能简单用 block_id * block_bytes；
+        # 复用 GPUCacheInterface 的既有切分逻辑（cache_engine.py:763 / :821）。
         items = []
         for index, block_id in enumerate(task.local_block_ids):
-            key = make_block_key(
+            key = make_block_key(                 # REQ-KVP-02
                 token_ids=task.token_ids,
                 block_index=index,
                 block_size=task.block_size,
@@ -682,36 +743,25 @@ class KVPoolWorker:
                 rank_info=self.rank_info,
                 tenant=task.tenant,
             )
-            addr = self.gpu_blocks.data_ptr() + block_id * task.block_bytes
-            items.append(GetItem(key, [(addr, task.block_bytes)]))
+            for segment in self.gpu_cache.segments_of(
+                    block_id, task.block_size, task.layout_version):
+                items.append(GetItem(segment.key_of(key), [(segment.addr, segment.size)]))
 
         if not items:
-            # 空分片也要上报成功，否则 engine 侧永远凑不满 CP 组。
-            return KVLoadCompletion(
-                request_id=task.request_id,
-                load_id=task.load_id,
-                block_results=[],
-                error=None,
-            )
-
+            # 空分片也要上报成功，否则 engine 侧永远凑不满期望 rank 数。
+            return KVLoadCompletion(task.request_id, task.load_id,
+                                    self.rank_info.cp_rank, [], None)
         try:
             block_results = self.store_client.get(items)
-            return KVLoadCompletion(
-                request_id=task.request_id,
-                load_id=task.load_id,
-                block_results=block_results,
-                error=None,
-            )
+            return KVLoadCompletion(task.request_id, task.load_id,
+                                    self.rank_info.cp_rank, block_results, None)
         except Exception as exc:
-            return KVLoadCompletion(
-                request_id=task.request_id,
-                load_id=task.load_id,
-                block_results=[False] * len(items),
-                error=exc,
-            )
+            return KVLoadCompletion(task.request_id, task.load_id,
+                                    self.rank_info.cp_rank,
+                                    [False] * len(task.local_block_ids), exc)
 ```
 
-### 6.6 初始化：engine 侧与每个 rank
+### 6.7 初始化：engine 侧与每个 rank
 
 对应 §5.2 的三条顺序约束，初始化伪代码只列新增部分：
 
@@ -730,7 +780,7 @@ self.scheduler = self._create_scheduler()            # 267 行：Scheduler 先�
 self.kv_load_manager = KVLoadManager(                # ③ 之后才能建聚合器
     self.kv_completion_queues,
     self.scheduler,
-    cp_ranks=tuple(range(cp_size)),
+    expected_ranks=tuple(range(cp_size)),
 )
 ```
 
@@ -744,50 +794,47 @@ WorkerBase.init_cache_engine                         # base.py:270-272，_init_c
     self.gpu_cache = self.cache_engine.gpu_cache     # ⑤ 此时 HBM segment 才存在
     if kv_pool_enabled:                              # ⑥ 建组件并注册 HBM
         self.kv_pool_connector = KVPoolConnector(    # 纯适配层，不持有跨进程队列
-            rank_info=...,
-            gpu_cache=self.gpu_cache,
+            worker=KVPoolWorker(
+                store_client=...,                    # REQ-KVP-03
+                gpu_cache=self.gpu_cache,
+            )                                        # 内部建 request_queue/finished_queue + 起 Get 线程
         )
-        self.kv_pool_worker = KVPoolWorker(          # 只持有 request/finished 队列
-            store_client=...,
-            gpu_cache=self.gpu_cache,
-        )                                            # 内部建 request_queue/finished_queue + 起 Get 线程
         register_hbm_segments(self.gpu_cache)        # 复用 REQ-KVP-01 的注册
 ```
 
-### 6.7 Worker：步内提交与回传
+### 6.8 Worker：步内提交与回传
 
 ```text
 class Worker:   # driver 与子进程执行同一份代码
     def __init__(self, ..., kv_completion_q):
         self.kv_completion_q = kv_completion_q   # 本 rank 的队列：rank0 进程内，rankN 跨进程
+        self.kv_pool_connector = None            # kv_pool 未启用时保持 None
 
     def execute_model_step(self, ..., kv_load_tasks=None):
-        # 1. forward（原有逻辑）
+        # 1. forward（原有逻辑；is_placeholder 的 dummy 分支同样会走到下面）
         ... execute_main_model ...
 
-        # 2. 提交本 rank 的 Get（轮不到本 rank 的任务为空）
-        if kv_load_tasks:
-            self.kv_pool_connector.start_load_kv(kv_load_tasks[self.cp_rank])
+        # 2. 提交 + 步内收口（每个 rank 都执行，任务列表各 rank 相同）
+        if self.kv_pool_connector is not None:
+            if kv_load_tasks:
+                self.kv_pool_connector.start_load_kv(kv_load_tasks)
+            for completion in self.kv_pool_connector.get_finished():
+                self.kv_completion_q.put(completion)
 
-        # 3. 步内收口：drain 本 rank 的 finish 队列
-        completions = self.kv_pool_connector.get_finished(self.active_req_ids)
-
-        # 4. 各 rank 写各自的 completion queue
-        for completion in completions:
-            self.kv_completion_q.put(completion)
-
-        # 5. sample / post_process（原有逻辑）
+        # 3. post_process(prev step) / sample / post_process(curr)（原有逻辑）
         ...
 ```
 
-调用点在 `worker.py:262-263` 的 `sample_end_evt.synchronize()` 之前，保证提交与收口都不占关键路径。
+调用点在 `worker.py:121-127` 的 forward 之后、`worker.py:262-263` 的 `sample_end_evt.synchronize()` 之前：提交与收口都不占关键路径。
 
 ### 7. 对外接口
 
 | 接口                                 | 调用方 -> 被调用方                             | 用途                                                              |
 | ------------------------------------ | ---------------------------------------------- | ----------------------------------------------------------------- |
 | `Scheduler.apply_kv_completions()` | `LLMEngine` -> `Scheduler`                 | 主线程消费已聚合的 completion 并迁移队列                          |
+| `KVLoadManager.register()`         | `LLMEngine` -> `KVLoadManager`             | 每步下发前登记期望 rank，避免 completion 早到被丢弃               |
 | `KVLoadManager.poll()`             | `LLMEngine` -> `KVLoadManager`             | 逐 rank 读取 completion queue 并按 `(request_id, load_id)` 聚合 |
+| `KVLoadManager.discard()`          | `LLMEngine` -> `KVLoadManager`             | 取消请求时清理聚合中的期望                                       |
 | `KVPoolConnector.start_load_kv()`  | `Worker` -> `KVPoolConnector`              | 把 `kv_load_tasks` 转成 worker 任务并入队（每 rank 一次）       |
 | `KVPoolConnector.get_finished()`   | `Worker` -> `KVPoolConnector`              | 步内 drain worker 的 finish 队列并返回给 Worker                   |
 | `Worker.kv_completion_q.put()`     | 各 rank `Worker` -> 本 rank completion queue | 各 rank 把完成结果写进自己的队列                                  |
